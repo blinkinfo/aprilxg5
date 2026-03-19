@@ -235,13 +235,18 @@ class SignalTracker:
         return "\n".join(lines)
 
     def format_signal_message(self, signal: Signal, prediction: dict) -> str:
-        """Format a new signal as a Telegram message."""
+        """Format a new signal as a Telegram message.
+
+        Includes signal strength from confidence filtering.
+        """
         direction_arrow = ">> UP" if signal.direction == "UP" else ">> DOWN"
+        strength = prediction.get("strength", "NORMAL")
+        strength_label = f" [{strength}]" if strength == "STRONG" else ""
 
         lines = [
             "========== BTC 5m SIGNAL ==========",
             "",
-            f"Direction: {direction_arrow}",
+            f"Direction: {direction_arrow}{strength_label}",
             f"Confidence: {signal.confidence:.1%}",
             "",
             f"Entry Price: ${signal.entry_price:,.2f}",

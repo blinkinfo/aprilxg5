@@ -4,6 +4,9 @@ scikit-learn==1.6.1
 numpy==1.26.4
 pandas==2.2.3
 
+# Hyperparameter optimization
+optuna==4.2.1
+
 # HTTP client
 httpx==0.28.1
 

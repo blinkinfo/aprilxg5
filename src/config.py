@@ -26,9 +26,9 @@ class MEXCConfig:
 class ModelConfig:
     """ML model configuration."""
     lookback_candles: int = 100  # Number of candles to use as features
-    train_candles: int = 5000  # Candles for initial training
+    train_candles: int = 43200  # ~150 days of 5m candles (was 5000)
     retrain_interval_hours: int = 6  # Retrain every N hours
-    prediction_threshold: float = 0.52  # Minimum confidence to emit signal
+    prediction_threshold: float = 0.55  # Minimum confidence to emit signal (raised from 0.52)
     # Feature engineering
     rsi_period: int = 14
     macd_fast: int = 12
@@ -42,7 +42,18 @@ class ModelConfig:
     adx_period: int = 14
     ema_fast: int = 9
     ema_slow: int = 21
-    # XGBoost params
+    # Confidence filtering (Improvement 2)
+    confidence_min: float = 0.55  # Skip trades below this confidence
+    confidence_strong: float = 0.60  # Label as "strong" signal above this
+    # Regime detection (Improvement 6)
+    atr_regime_lookback: int = 100  # Lookback period for ATR percentile
+    # Optuna tuning (Improvement 5)
+    enable_optuna_tuning: bool = True
+    optuna_n_trials: int = 30  # Number of Bayesian optimization trials
+    optuna_tune_interval_hours: int = 24  # Re-tune hyperparams every N hours
+    # Walk-forward retraining gate (Improvement 4)
+    retrain_min_improvement: float = 0.002  # New model must beat old by this margin
+    # XGBoost default params (may be overridden by Optuna)
     xgb_params: dict = field(default_factory=lambda: {
         "n_estimators": 500,
         "max_depth": 6,
@@ -100,5 +111,13 @@ class BotConfig:
             config.model.retrain_interval_hours = int(os.environ["RETRAIN_INTERVAL_HOURS"])
         if os.environ.get("LOOKBACK_CANDLES"):
             config.model.lookback_candles = int(os.environ["LOOKBACK_CANDLES"])
+        if os.environ.get("CONFIDENCE_MIN"):
+            config.model.confidence_min = float(os.environ["CONFIDENCE_MIN"])
+        if os.environ.get("ENABLE_OPTUNA"):
+            config.model.enable_optuna_tuning = os.environ["ENABLE_OPTUNA"].lower() in ("1", "true", "yes")
+        if os.environ.get("OPTUNA_TRIALS"):
+            config.model.optuna_n_trials = int(os.environ["OPTUNA_TRIALS"])
+        if os.environ.get("TRAIN_CANDLES"):
+            config.model.train_candles = int(os.environ["TRAIN_CANDLES"])
 
         return config

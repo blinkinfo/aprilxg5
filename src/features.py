@@ -1,4 +1,9 @@
-"""Feature engineering for BTC price prediction."""
+"""Feature engineering for BTC price prediction.
+
+Improvements over original:
+- Improvement 3: All raw price-scale features normalized to percentages/z-scores
+- Improvement 6: Volatility regime detection (ATR percentile)
+"""
 import logging
 
 import numpy as np
@@ -31,7 +36,7 @@ class FeatureEngineer:
 
         feat = df.copy()
 
-        # --- Price Action Features ---
+        # --- Price Action Features (all normalized as pct of price) ---
         feat["returns_1"] = feat["close"].pct_change(1)
         feat["returns_3"] = feat["close"].pct_change(3)
         feat["returns_5"] = feat["close"].pct_change(5)
@@ -66,13 +71,18 @@ class FeatureEngineer:
         rsi_range = rsi_max - rsi_min
         feat["stoch_rsi"] = np.where(rsi_range != 0, (rsi - rsi_min) / rsi_range, 0.5)
 
-        # --- MACD ---
+        # --- MACD (Improvement 3: normalized to percentage of price) ---
         ema_fast_macd = feat["close"].ewm(span=self.config.macd_fast, adjust=False).mean()
         ema_slow_macd = feat["close"].ewm(span=self.config.macd_slow, adjust=False).mean()
-        feat["macd_line"] = ema_fast_macd - ema_slow_macd
-        feat["macd_signal"] = feat["macd_line"].ewm(span=self.config.macd_signal, adjust=False).mean()
-        feat["macd_histogram"] = feat["macd_line"] - feat["macd_signal"]
-        feat["macd_hist_norm"] = feat["macd_histogram"] / feat["close"]
+        feat["macd_line_raw"] = ema_fast_macd - ema_slow_macd
+        feat["macd_signal_raw"] = feat["macd_line_raw"].ewm(span=self.config.macd_signal, adjust=False).mean()
+        feat["macd_histogram_raw"] = feat["macd_line_raw"] - feat["macd_signal_raw"]
+
+        # Normalized MACD features (percentage of close price)
+        feat["macd_line"] = feat["macd_line_raw"] / feat["close"]
+        feat["macd_signal"] = feat["macd_signal_raw"] / feat["close"]
+        feat["macd_histogram"] = feat["macd_histogram_raw"] / feat["close"]
+        feat["macd_hist_norm"] = feat["macd_histogram"]  # alias for lag features
 
         # --- Bollinger Bands ---
         bb_sma = feat["close"].rolling(self.config.bb_period).mean()
@@ -133,6 +143,26 @@ class FeatureEngineer:
             1.0
         )
 
+        # --- Improvement 6: Volatility Regime Detection ---
+        atr_lookback = self.config.atr_regime_lookback
+        feat["atr_percentile"] = feat["atr_norm"].rolling(atr_lookback, min_periods=1).apply(
+            lambda x: pd.Series(x).rank(pct=True).iloc[-1], raw=False
+        )
+        # Binary regime: 1 = high-vol (top 30%), 0 = low-vol
+        feat["regime_high_vol"] = (feat["atr_percentile"] > 0.70).astype(int)
+        # Continuous regime score (0-1, more granular than binary)
+        feat["regime_vol_score"] = feat["atr_percentile"].clip(0, 1)
+        # Volatility expansion/contraction: is current vol expanding vs recent?
+        feat["vol_expansion"] = feat["atr_norm"].pct_change(5)
+
+        # --- Improvement 3: Normalized momentum features ---
+        # Replace raw momentum_3 with pct-based (returns_3 already exists but
+        # add explicit momentum z-scores for the model)
+        feat["momentum_3_zscore"] = self._rolling_zscore(feat["returns_3"], 50)
+        feat["momentum_5_zscore"] = self._rolling_zscore(feat["returns_5"], 50)
+        feat["rsi_zscore"] = self._rolling_zscore(feat["rsi"], 50)
+        feat["volume_ratio_zscore"] = self._rolling_zscore(feat["volume_ratio"], 50)
+
         # --- Pattern Features ---
         feat["higher_high"] = (feat["high"] > feat["high"].shift(1)).astype(int)
         feat["lower_low"] = (feat["low"] < feat["low"].shift(1)).astype(int)
@@ -154,7 +184,9 @@ class FeatureEngineer:
         drop_cols = ["timestamp", "open", "high", "low", "close", "volume",
                      "close_time", "quote_volume", "ema_fast", "ema_slow",
                      "sma_50", "bb_upper", "bb_lower", "obv", "obv_sma",
-                     "volume_sma", "atr"]
+                     "volume_sma", "atr",
+                     # Drop raw MACD columns (kept normalized versions)
+                     "macd_line_raw", "macd_signal_raw", "macd_histogram_raw"]
         feature_cols = [c for c in feat.columns if c not in drop_cols]
         result = feat[feature_cols].copy()
         return result
@@ -193,7 +225,6 @@ class FeatureEngineer:
         close = df["close"]
         idx = df.index
 
-        # Use .values to get raw numpy arrays, avoiding pandas index alignment issues
         plus_dm = high.diff().values
         minus_dm = (-low.diff()).values
         plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
@@ -228,6 +259,14 @@ class FeatureEngineer:
         return mfi.fillna(50)
 
     @staticmethod
+    def _rolling_zscore(series: pd.Series, window: int) -> pd.Series:
+        """Compute rolling z-score for normalization."""
+        rolling_mean = series.rolling(window).mean()
+        rolling_std = series.rolling(window).std()
+        zscore = np.where(rolling_std != 0, (series - rolling_mean) / rolling_std, 0.0)
+        return pd.Series(zscore, index=series.index)
+
+    @staticmethod
     def _consecutive_count(binary_series: pd.Series) -> pd.Series:
         groups = binary_series.ne(binary_series.shift()).cumsum()
         return binary_series.groupby(groups).cumsum()
@@ -240,15 +279,15 @@ class FeatureEngineer:
 
             suffix = f"_{tf_name.replace('m', 'min').replace('h', 'hr')}"
 
-            # Compute trend direction on higher TF
+            # Compute trend direction on higher TF (already normalized as pct)
             tf_ema_fast = tf_df["close"].ewm(span=9, adjust=False).mean()
             tf_ema_slow = tf_df["close"].ewm(span=21, adjust=False).mean()
             tf_trend = ((tf_ema_fast - tf_ema_slow) / tf_df["close"]).values
 
-            # Compute RSI on higher TF
+            # Compute RSI on higher TF (0-100 scale, already normalized)
             tf_rsi = self._compute_rsi(tf_df["close"], 14).values
 
-            # Compute momentum
+            # Compute momentum as pct change (already normalized)
             tf_momentum = tf_df["close"].pct_change(5).values
 
             # Map to 5m candles using timestamp alignment

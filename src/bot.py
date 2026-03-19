@@ -1,4 +1,8 @@
-"""Main bot orchestrator - ties everything together."""
+"""Main bot orchestrator - ties everything together.
+
+Preserves the 15-second pre-signal timing by design.
+Integrates: retraining gate messaging, signal strength labels, Optuna status.
+"""
 import asyncio
 import logging
 import os
@@ -30,7 +34,7 @@ class SignalBot:
     async def start(self):
         """Start the bot."""
         logger.info("="*50)
-        logger.info("BTC 5m Signal Bot starting...")
+        logger.info("BTC 5m Signal Bot starting (aprilxg v2)...")
         logger.info("="*50)
 
         # Create directories
@@ -56,9 +60,14 @@ class SignalBot:
             logger.info(f"Model loaded (val_acc={self.model.val_accuracy:.4f})")
 
         # Send startup message
+        optuna_status = "ON" if self.config.model.enable_optuna_tuning else "OFF"
         await self.telegram.send_message(
-            "BTC 5m Signal Bot ONLINE\n\n"
+            "BTC 5m Signal Bot ONLINE (aprilxg v2)\n\n"
             f"Model accuracy: {self.model.val_accuracy:.1%}\n"
+            f"Confidence threshold: {self.config.model.confidence_min:.0%}\n"
+            f"Training data: {self.config.model.train_candles} candles (~{self.config.model.train_candles * 5 // 1440} days)\n"
+            f"Optuna tuning: {optuna_status}\n"
+            f"Retraining gate: {self.config.model.retrain_min_improvement:.3f} min improvement\n"
             f"Tracked signals: {len(self.tracker.signals)}\n"
             f"Symbol: {self.config.mexc.symbol}\n\n"
             "Signals will be posted automatically.\n"
@@ -80,7 +89,11 @@ class SignalBot:
         logger.info("Bot stopped")
 
     async def _main_loop(self):
-        """Main prediction loop."""
+        """Main prediction loop.
+
+        CRITICAL: The 15-second pre-signal timing is preserved here.
+        prediction_lead_seconds controls when the signal fires before candle close.
+        """
         logger.info("Entering main prediction loop")
 
         while self._running:
@@ -145,12 +158,18 @@ class SignalBot:
                     entry_price=prediction["current_price"],
                 )
 
-                # Send to Telegram
+                # Send to Telegram with strength indicator
                 msg = self.tracker.format_signal_message(sig, prediction)
                 await self.telegram.send_message(msg)
-                logger.info(f"Signal sent: {prediction['signal']} @ ${prediction['current_price']:,.2f}")
+                logger.info(
+                    f"Signal sent: {prediction['signal']} [{prediction.get('strength', 'NORMAL')}] "
+                    f"@ ${prediction['current_price']:,.2f}"
+                )
             else:
-                logger.info(f"No signal: confidence below threshold ({prediction['confidence']:.4f})")
+                logger.info(
+                    f"No signal: confidence below {self.config.model.confidence_min} "
+                    f"({prediction['confidence']:.4f})"
+                )
 
         except Exception as e:
             logger.error(f"Prediction cycle error: {e}", exc_info=True)
@@ -183,7 +202,7 @@ class SignalBot:
         """Train or retrain the model."""
         try:
             logger.info("Fetching training data...")
-            # Fetch historical 5m data
+            # Fetch historical 5m data (now 43,200 candles = ~150 days)
             df_5m = await self.fetcher.fetch_historical_klines(
                 interval="5m",
                 total_candles=self.config.model.train_candles,
@@ -200,21 +219,26 @@ class SignalBot:
             )
             higher_tf = {k: v for k, v in higher_tf.items() if not v.empty}
 
-            # Train
+            # Train (model internally handles the retraining gate)
             metrics = self.model.train(df_5m, higher_tf)
 
             # Save model
             self.model.save(self.config.model_dir)
 
-            # Notify
+            # Notify with retraining gate status
+            swapped_str = "NEW MODEL ACTIVE" if metrics["model_swapped"] else "KEPT PREVIOUS MODEL (new one wasn't better)"
+            optuna_str = "Optuna-tuned" if metrics.get("optuna_tuned") else "Default params"
+
             msg = (
-                "Model Trained Successfully\n\n"
+                "Model Training Complete\n\n"
+                f"Result: {swapped_str}\n\n"
                 f"Training samples: {metrics['total_samples']}\n"
                 f"Features: {metrics['n_features']}\n"
-                f"Train accuracy: {metrics['train_accuracy']:.1%}\n"
-                f"Val accuracy: {metrics['val_accuracy']:.1%}\n"
+                f"New model val accuracy: {metrics['val_accuracy']:.1%}\n"
+                f"Active model val accuracy: {metrics['active_val_accuracy']:.1%}\n"
                 f"CV accuracy: {metrics['cv_accuracy']:.1%}\n"
-                f"Val log loss: {metrics['val_logloss']:.4f}"
+                f"Val log loss: {metrics['val_logloss']:.4f}\n"
+                f"Params: {optuna_str}"
             )
             await self.telegram.send_message(msg)
             logger.info("Model training complete")
@@ -254,24 +278,29 @@ class SignalBot:
             minutes = int((remaining % 3600) // 60)
             retrain_in = f"{hours}h {minutes}m"
 
+        optuna_status = "ON" if self.config.model.enable_optuna_tuning else "OFF"
+        tuned_str = "Yes" if self.model.best_xgb_params else "No (using defaults)"
+
         return (
-            "---------- BOT STATUS ----------\n"
+            "---------- BOT STATUS (v2) ----------\n"
             f"Status: {'RUNNING' if self._running else 'STOPPED'}\n"
             f"Symbol: {self.config.mexc.symbol}\n"
             f"Model accuracy: {self.model.val_accuracy:.1%}\n"
             f"Training samples: {self.model.train_samples}\n"
             f"Last trained: {self.model.last_train_time.strftime('%Y-%m-%d %H:%M') if self.model.last_train_time else 'Never'}\n"
             f"Next retrain in: {retrain_in}\n"
-            f"Confidence threshold: {self.config.model.prediction_threshold:.0%}\n"
+            f"Confidence threshold: {self.config.model.confidence_min:.0%}\n"
+            f"Retraining gate: {self.config.model.retrain_min_improvement:.3f}\n"
+            f"Optuna: {optuna_status} | Tuned: {tuned_str}\n"
             f"Total signals: {stats.total_signals}\n"
             f"Pending: {stats.pending}\n"
-            "----------------------------------"
+            "--------------------------------------"
         )
 
     async def _retrain_model(self) -> str:
         try:
             await self._train_model()
-            return f"Retrain complete! Val accuracy: {self.model.val_accuracy:.1%}"
+            return f"Retrain complete! Active model val accuracy: {self.model.val_accuracy:.1%}"
         except Exception as e:
             return f"Retrain failed: {str(e)[:200]}"
 
