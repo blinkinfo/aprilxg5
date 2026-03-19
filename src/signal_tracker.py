@@ -343,7 +343,8 @@ class SignalTracker:
     def format_signal_message(self, signal: Signal, prediction: dict) -> str:
         """Format a new signal as a Telegram message.
 
-        Includes candle slot in UTC and signal strength.
+        At signal time the candle has not opened yet, so we show
+        'Prediction for:' and omit the unknown candle open price.
         """
         direction_arrow = ">> UP" if signal.direction == "UP" else ">> DOWN"
         strength = prediction.get("strength", "NORMAL")
@@ -355,12 +356,11 @@ class SignalTracker:
         lines = [
             "========== BTC 5m SIGNAL ==========",
             "",
-            f"Slot: {slot_str}",
+            f"Prediction for: {slot_str}",
             f"Direction: {direction_arrow}{strength_label}",
             f"Confidence: {signal.confidence:.1%}",
             "",
             f"Current Price: ${signal.entry_price:,.2f}",
-            f"Candle Open: ${signal.candle_open_price:,.2f}",
             f"P(Up): {prediction.get('prob_up', 0):.1%} | P(Down): {prediction.get('prob_down', 0):.1%}",
             "",
             f"Model Accuracy: {prediction.get('model_accuracy', 0):.1%}",
@@ -384,7 +384,7 @@ class SignalTracker:
         lines = [
             "---------- SIGNAL RESOLVED ----------",
             "",
-            f"Slot: {slot_str}",
+            f"Candle: {slot_str}",
             f"Signal #{signal.signal_id}: {signal.direction}",
             f"Result: {result_label}",
             "",

@@ -4,9 +4,10 @@ Preserves the 15-second pre-signal timing by design.
 Integrates: retraining gate messaging, signal strength labels, Optuna status.
 
 Fixes applied:
+- Signal predicts the NEXT candle (current_slot + 5min), not the current one
 - Resolution uses candle open/close from MEXC (matches Polymarket binary outcome)
-- Signals store candle slot timestamp; resolution only fires for PREVIOUS candles
-- Resolution waits >= 30 seconds into new candle for exchange data to settle
+- Signals store NEXT candle slot timestamp; resolution only fires once that candle closes
+- Resolution waits >= 30 seconds into the candle AFTER the predicted one for data to settle
 - Dedup guard prevents double-resolution within the same window
 - Startup resolves any stale pending signals from prior sessions
 - All timestamps in UTC
@@ -31,6 +32,9 @@ logger = logging.getLogger(__name__)
 RESOLUTION_DELAY_SECONDS = 30
 # Upper bound of the resolution window (avoid running too late).
 RESOLUTION_WINDOW_END = 90
+
+# Candle period in minutes (5-minute candles)
+CANDLE_PERIOD_MINUTES = 5
 
 
 def _candle_slot_open(dt: datetime, period_minutes: int = 5) -> datetime:
@@ -129,8 +133,11 @@ class SignalBot:
 
         CRITICAL timing design:
         - Signal fires <= 15 seconds before candle close (prediction_lead_seconds).
-        - Resolution fires 30-90 seconds into the NEXT candle, ensuring the
-          previous candle is fully settled on MEXC.
+          The signal is labeled for the NEXT candle (current_slot + 5min) because
+          the model predicts the NEXT candle's direction (trained with shift(-1) labels).
+        - Resolution fires 30-90 seconds into a new candle. It resolves any pending
+          signals whose candle_slot_ts is strictly OLDER than the current candle
+          (meaning that predicted candle has fully closed).
         - Dedup guards prevent duplicate signals AND duplicate resolutions.
         """
         logger.info("Entering main prediction loop")
@@ -172,6 +179,10 @@ class SignalBot:
     async def _run_prediction_cycle(self, now: datetime, current_slot: datetime):
         """Fetch data and make a prediction.
 
+        The model predicts the direction of the NEXT candle (trained with
+        shift(-1) labels). So the signal is labeled for the NEXT slot, not
+        the current one that is about to close.
+
         Args:
             now: Current UTC datetime
             current_slot: The open timestamp of the current 5-min candle
@@ -194,20 +205,24 @@ class SignalBot:
             prediction = self.model.predict(df_5m, higher_tf)
 
             if prediction["signal"] in ("UP", "DOWN"):
-                # Get the current candle's open price from MEXC data.
-                # The last row in df_5m whose timestamp matches current_slot
-                # is the live candle — its 'open' is the candle open.
-                candle_open_price = float(df_5m["open"].iloc[-1])
+                # ----------------------------------------------------------------
+                # KEY FIX: The model predicts the NEXT candle, not the current one.
+                # current_slot is the candle about to close (e.g. 16:40).
+                # The prediction is for the NEXT candle (e.g. 16:45-16:50).
+                # ----------------------------------------------------------------
+                next_slot = current_slot + timedelta(minutes=CANDLE_PERIOD_MINUTES)
+                next_slot_iso = next_slot.isoformat()
 
-                # Store the candle slot timestamp as ISO string
-                candle_slot_iso = current_slot.isoformat()
+                # We don't know the next candle's open price yet (it hasn't started).
+                # It will be filled in during resolution when the candle data is available.
+                candle_open_price = 0.0
 
-                # Record signal with candle slot info
+                # Record signal with NEXT candle slot info
                 sig = self.tracker.add_signal(
                     direction=prediction["signal"],
                     confidence=prediction["confidence"],
                     entry_price=prediction["current_price"],
-                    candle_slot_ts=candle_slot_iso,
+                    candle_slot_ts=next_slot_iso,
                     candle_open_price=candle_open_price,
                 )
 
@@ -216,7 +231,8 @@ class SignalBot:
                 await self.telegram.send_message(msg)
                 logger.info(
                     f"Signal sent: {prediction['signal']} [{prediction.get('strength', 'NORMAL')}] "
-                    f"@ ${prediction['current_price']:,.2f} (slot={candle_slot_iso})"
+                    f"@ ${prediction['current_price']:,.2f} "
+                    f"(predicting next slot={next_slot_iso})"
                 )
             else:
                 logger.info(
@@ -228,13 +244,15 @@ class SignalBot:
             logger.error(f"Prediction cycle error: {e}", exc_info=True)
 
     async def _resolve_pending_signals(self, current_slot: datetime):
-        """Resolve pending signals whose candle has fully closed.
+        """Resolve pending signals whose predicted candle has fully closed.
 
         Only resolves signals whose candle_slot_ts is strictly BEFORE
         current_slot, ensuring we never resolve a candle that's still live.
 
-        Fetches the specific closed candle by timestamp from MEXC and uses
-        its open/close prices for WIN/LOSS (matching Polymarket).
+        Example timeline:
+        - Signal at 16:44:45 predicts the 16:45-16:50 candle (candle_slot_ts=16:45)
+        - At 16:50:30 (current_slot=16:50), 16:45 < 16:50 -> resolvable
+        - Fetches the 16:45 candle's open/close from MEXC for WIN/LOSS
 
         Args:
             current_slot: The open timestamp of the current (live) candle
@@ -269,7 +287,7 @@ class SignalBot:
                 }
 
             for sig in resolvable:
-                # Find the candle matching this signal's slot
+                # Find the candle matching this signal's predicted slot
                 candle_data = candle_lookup.get(sig.candle_slot_ts)
 
                 if candle_data is None:
@@ -451,7 +469,8 @@ class SignalBot:
             if s.candle_slot_ts:
                 try:
                     dt = datetime.fromisoformat(s.candle_slot_ts)
-                    slot_str = f" | {dt.strftime('%H:%M')} UTC"
+                    end_dt = dt + timedelta(minutes=CANDLE_PERIOD_MINUTES)
+                    slot_str = f" | {dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')} UTC"
                 except (ValueError, TypeError):
                     slot_str = ""
             lines.append(
