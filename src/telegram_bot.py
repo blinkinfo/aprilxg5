@@ -1,0 +1,190 @@
+"""Telegram bot for signal delivery and interactive commands."""
+import asyncio
+import logging
+from typing import Optional, Callable, Awaitable
+
+from telegram import Update, Bot
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
+
+from .config import TelegramConfig
+
+logger = logging.getLogger(__name__)
+
+
+class TelegramBot:
+    """Telegram bot for delivering signals and handling commands."""
+
+    def __init__(self, config: TelegramConfig):
+        self.config = config
+        self.bot: Optional[Bot] = None
+        self.application: Optional[Application] = None
+        self._stats_callback: Optional[Callable[[], str]] = None
+        self._recent_callback: Optional[Callable[[], str]] = None
+        self._status_callback: Optional[Callable[[], Awaitable[str]]] = None
+        self._retrain_callback: Optional[Callable[[], Awaitable[str]]] = None
+
+    def set_callbacks(
+        self,
+        stats_cb: Optional[Callable[[], str]] = None,
+        recent_cb: Optional[Callable[[], str]] = None,
+        status_cb: Optional[Callable[[], Awaitable[str]]] = None,
+        retrain_cb: Optional[Callable[[], Awaitable[str]]] = None,
+    ):
+        """Set callback functions for bot commands."""
+        self._stats_callback = stats_cb
+        self._recent_callback = recent_cb
+        self._status_callback = status_cb
+        self._retrain_callback = retrain_cb
+
+    async def initialize(self):
+        """Initialize the bot and register handlers."""
+        if not self.config.bot_token:
+            logger.warning("No Telegram bot token configured")
+            return
+
+        self.application = (
+            Application.builder()
+            .token(self.config.bot_token)
+            .build()
+        )
+        self.bot = self.application.bot
+
+        # Register command handlers
+        self.application.add_handler(CommandHandler("start", self._cmd_start))
+        self.application.add_handler(CommandHandler("help", self._cmd_help))
+        self.application.add_handler(CommandHandler("stats", self._cmd_stats))
+        self.application.add_handler(CommandHandler("recent", self._cmd_recent))
+        self.application.add_handler(CommandHandler("status", self._cmd_status))
+        self.application.add_handler(CommandHandler("retrain", self._cmd_retrain))
+
+        await self.application.initialize()
+        logger.info("Telegram bot initialized")
+
+    async def start_polling(self):
+        """Start polling for commands in the background."""
+        if self.application is None:
+            return
+        await self.application.start()
+        await self.application.updater.start_polling(drop_pending_updates=True)
+        logger.info("Telegram bot polling started")
+
+    async def stop(self):
+        """Stop the bot."""
+        if self.application is not None:
+            await self.application.updater.stop()
+            await self.application.stop()
+            await self.application.shutdown()
+            logger.info("Telegram bot stopped")
+
+    async def send_message(self, text: str, chat_id: Optional[str] = None) -> bool:
+        """Send a message to the configured chat.
+
+        Args:
+            text: Message text
+            chat_id: Override chat ID (uses config default if None)
+
+        Returns:
+            True if sent successfully
+        """
+        target_chat = chat_id or self.config.chat_id
+        if not target_chat or not self.bot:
+            logger.warning("Cannot send message: no chat_id or bot not initialized")
+            return False
+
+        try:
+            # Split long messages
+            messages = self._split_message(text)
+            for msg in messages:
+                await self.bot.send_message(
+                    chat_id=target_chat,
+                    text=msg,
+                    parse_mode=None,  # Plain text for reliability
+                )
+                if len(messages) > 1:
+                    await asyncio.sleep(0.5)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send Telegram message: {e}")
+            return False
+
+    def _split_message(self, text: str) -> list[str]:
+        """Split message into chunks that fit Telegram's limit."""
+        max_len = self.config.max_message_length
+        if len(text) <= max_len:
+            return [text]
+
+        chunks = []
+        while text:
+            if len(text) <= max_len:
+                chunks.append(text)
+                break
+            # Find last newline before limit
+            split_at = text.rfind("\n", 0, max_len)
+            if split_at == -1:
+                split_at = max_len
+            chunks.append(text[:split_at])
+            text = text[split_at:].lstrip("\n")
+        return chunks
+
+    # --- Command Handlers ---
+
+    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        await update.message.reply_text(
+            f"BTC 5m Signal Bot active!\n\n"
+            f"Your Chat ID: {chat_id}\n\n"
+            f"Commands:\n"
+            f"/stats - View signal performance\n"
+            f"/recent - Recent signals\n"
+            f"/status - Bot status\n"
+            f"/retrain - Force model retrain\n"
+            f"/help - Show this help"
+        )
+
+    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "BTC 5-Minute Signal Bot\n"
+            "========================\n\n"
+            "This bot predicts the direction of the next BTC 5-minute candle "
+            "using an XGBoost ML model with multi-timeframe features.\n\n"
+            "Commands:\n"
+            "/stats - Full performance stats (W/L, PnL, streaks)\n"
+            "/recent - Last 10 signals with results\n"
+            "/status - Model & bot status\n"
+            "/retrain - Force model retraining\n"
+            "/start - Show welcome & chat ID\n"
+            "/help - This help message"
+        )
+
+    async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self._stats_callback:
+            text = self._stats_callback()
+        else:
+            text = "Stats not available yet."
+        await update.message.reply_text(text)
+
+    async def _cmd_recent(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self._recent_callback:
+            text = self._recent_callback()
+        else:
+            text = "No recent signals."
+        await update.message.reply_text(text)
+
+    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if self._status_callback:
+            text = await self._status_callback()
+        else:
+            text = "Status not available."
+        await update.message.reply_text(text)
+
+    async def _cmd_retrain(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Starting model retrain...")
+        if self._retrain_callback:
+            text = await self._retrain_callback()
+        else:
+            text = "Retrain not available."
+        await update.message.reply_text(text)

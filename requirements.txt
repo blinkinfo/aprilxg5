@@ -1,0 +1,14 @@
+# Core ML
+xgboost==2.1.4
+scikit-learn==1.6.1
+numpy==1.26.4
+pandas==2.2.3
+
+# HTTP client
+httpx==0.28.1
+
+# Telegram
+python-telegram-bot==21.10
+
+# Utils
+python-dotenv==1.0.1
