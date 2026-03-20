@@ -4,10 +4,17 @@ Improvements:
 - Improvement 2: Confidence filtering — skip low-confidence predictions
 - Improvement 4: Walk-forward retraining gate — only swap model if new one is better
 - Improvement 5: Optuna Bayesian hyperparameter optimization
+
+Fixes applied:
+- Removed deprecated use_label_encoder param (xgboost >= 1.7)
+- Added timeout guard to Optuna tuning to prevent container kills
+- Reduced Optuna CV folds from 3 to 2 for faster tuning on large datasets
+- Suppressed noisy xgboost deprecation warnings
 """
 import logging
 import os
 import pickle
+import warnings
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -19,6 +26,10 @@ from xgboost import XGBClassifier
 
 from .config import ModelConfig
 from .features import FeatureEngineer
+
+# Suppress the noisy xgboost "use_label_encoder" deprecation warning
+# and any other non-critical xgboost warnings that spam logs.
+warnings.filterwarnings("ignore", category=UserWarning, module="xgboost")
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +64,8 @@ class PredictionModel:
         """Improvement 5: Bayesian hyperparameter optimization with Optuna.
 
         Uses TimeSeriesSplit CV to find optimal XGBoost parameters.
+        Enforces both a trial count limit AND a wall-clock timeout so
+        tuning cannot exceed the container's health-check window.
 
         Args:
             X: Feature matrix
@@ -68,9 +81,17 @@ class PredictionModel:
             logger.warning("Optuna not installed, using default params")
             return self.config.xgb_params.copy()
 
-        logger.info(f"Starting Optuna hyperparameter tuning ({self.config.optuna_n_trials} trials)...")
+        n_trials = self.config.optuna_n_trials
+        timeout_sec = self.config.optuna_timeout_seconds
 
-        tscv = TimeSeriesSplit(n_splits=3)
+        logger.info(
+            f"Starting Optuna hyperparameter tuning "
+            f"({n_trials} trials, {timeout_sec}s timeout)..."
+        )
+
+        # Use 2-fold CV for speed on large datasets.
+        # With 43k samples each fold still has ~21k train / ~21k val.
+        tscv = TimeSeriesSplit(n_splits=2)
 
         def objective(trial):
             params = {
@@ -85,7 +106,6 @@ class PredictionModel:
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.1, 5.0, log=True),
                 "objective": "binary:logistic",
                 "eval_metric": "logloss",
-                "use_label_encoder": False,
                 "random_state": 42,
                 "n_jobs": -1,
             }
@@ -106,21 +126,34 @@ class PredictionModel:
 
             return np.mean(cv_scores)
 
-        study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=42))
-        study.optimize(objective, n_trials=self.config.optuna_n_trials, show_progress_bar=False)
+        study = optuna.create_study(
+            direction="minimize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+        )
+        study.optimize(
+            objective,
+            n_trials=n_trials,
+            timeout=timeout_sec,  # Hard wall-clock cap
+            show_progress_bar=False,
+        )
 
         best = study.best_params
         best.update({
             "objective": "binary:logistic",
             "eval_metric": "logloss",
-            "use_label_encoder": False,
             "random_state": 42,
             "n_jobs": -1,
         })
 
-        logger.info(f"Optuna best logloss: {study.best_value:.6f}")
-        logger.info(f"Best params: max_depth={best['max_depth']}, lr={best['learning_rate']:.4f}, "
-                    f"n_est={best['n_estimators']}, subsample={best['subsample']:.2f}")
+        completed = len(study.trials)
+        logger.info(
+            f"Optuna finished: {completed}/{n_trials} trials completed, "
+            f"best logloss: {study.best_value:.6f}"
+        )
+        logger.info(
+            f"Best params: max_depth={best['max_depth']}, lr={best['learning_rate']:.4f}, "
+            f"n_est={best['n_estimators']}, subsample={best['subsample']:.2f}"
+        )
 
         self.best_xgb_params = best
         self.last_tune_time = datetime.now(timezone.utc)

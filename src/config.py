@@ -57,11 +57,13 @@ class ModelConfig:
     atr_regime_lookback: int = 100  # Lookback period for ATR percentile
     # Optuna tuning (Improvement 5)
     enable_optuna_tuning: bool = True
-    optuna_n_trials: int = 30  # Number of Bayesian optimization trials
+    optuna_n_trials: int = 15  # Bayesian optimization trials (reduced from 30 to fit Railway timeout)
     optuna_tune_interval_hours: int = 24  # Re-tune hyperparams every N hours
+    optuna_timeout_seconds: int = 180  # Hard cap per tuning session (3 min)
     # Walk-forward retraining gate (Improvement 4)
     retrain_min_improvement: float = 0.002  # New model must beat old by this margin
     # XGBoost default params (may be overridden by Optuna)
+    # NOTE: use_label_encoder was removed — it is deprecated in xgboost >= 1.7
     xgb_params: dict = field(default_factory=lambda: {
         "n_estimators": 500,
         "max_depth": 6,
@@ -74,7 +76,6 @@ class ModelConfig:
         "reg_lambda": 1.0,
         "objective": "binary:logistic",
         "eval_metric": "logloss",
-        "use_label_encoder": False,
         "random_state": 42,
         "n_jobs": -1,
     })
@@ -125,6 +126,8 @@ class BotConfig:
             config.model.enable_optuna_tuning = os.environ["ENABLE_OPTUNA"].lower() in ("1", "true", "yes")
         if os.environ.get("OPTUNA_TRIALS"):
             config.model.optuna_n_trials = int(os.environ["OPTUNA_TRIALS"])
+        if os.environ.get("OPTUNA_TIMEOUT"):
+            config.model.optuna_timeout_seconds = int(os.environ["OPTUNA_TIMEOUT"])
         if os.environ.get("TRAIN_CANDLES"):
             config.model.train_candles = int(os.environ["TRAIN_CANDLES"])
 
@@ -142,7 +145,8 @@ class BotConfig:
             f"(~{config.model.train_candles * 5 // 1440} days of 5m data), "
             f"retrain_interval={config.model.retrain_interval_hours}h, "
             f"confidence_min={config.model.confidence_min}, "
-            f"optuna={'ON' if config.model.enable_optuna_tuning else 'OFF'}"
+            f"optuna={'ON' if config.model.enable_optuna_tuning else 'OFF'} "
+            f"({config.model.optuna_n_trials} trials, {config.model.optuna_timeout_seconds}s timeout)"
         )
 
         return config
