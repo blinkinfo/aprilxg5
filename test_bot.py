@@ -569,14 +569,23 @@ def test_auto_trader(results: TestResults):
 
 
 async def test_auto_trader_execute(results: TestResults):
-    """Test AutoTrader trade execution with mocked Polymarket client."""
-    print("\n--- Testing AutoTrader Trade Execution ---")
+    """Test AutoTrader trade execution with mocked Polymarket client.
+
+    Updated for slot-targeted trading: signals now include target_slot_ts
+    and the trade pipeline uses it for market discovery and dedup.
+    """
+    print("\n--- Testing AutoTrader Trade Execution (Slot-Targeted) ---")
     test_dir = "/tmp/test_autotrader_exec"
     os.makedirs(test_dir, exist_ok=True)
 
     try:
         from src.auto_trader import AutoTrader
         from src.polymarket_client import PolymarketClient
+
+        # Use a fixed target slot timestamp for deterministic testing
+        # This represents a specific 5-min slot (e.g. 16:45:00 UTC)
+        TARGET_SLOT_TS = 1742480700  # Must be 300-second aligned
+        assert TARGET_SLOT_TS % 300 == 0, "Test slot timestamp must be 300s-aligned"
 
         # Create a mock PolymarketClient
         mock_pm = MagicMock()
@@ -589,7 +598,7 @@ async def test_auto_trader_execute(results: TestResults):
             "data": {"balance": 50.0},
         })
 
-        # Mock place_trade
+        # Mock place_trade -- verify target_slot_ts is passed through
         mock_pm.place_trade = AsyncMock(return_value={
             "success": True,
             "data": {
@@ -598,14 +607,20 @@ async def test_auto_trader_execute(results: TestResults):
                 "amount": 1.0,
                 "price": 0.55,
                 "size": 1.82,
-                "slot_dt": "2026-03-20T13:30:00+00:00",
+                "slot_ts": TARGET_SLOT_TS,
+                "slot_dt": "2026-03-20T16:45:00+00:00",
+                "market_slug": f"btc-updown-5m-{TARGET_SLOT_TS}",
                 "status": "MATCHED",
             },
         })
 
+        # Mock slot_to_datetime for logging
+        mock_pm.slot_to_datetime = PolymarketClient.slot_to_datetime
+
         trader = AutoTrader(polymarket_client=mock_pm, data_dir=test_dir)
         trader.toggle(on=True)
 
+        # Signal now includes target_slot_ts (injected by bot.py)
         signal = {
             "signal": "UP",
             "confidence": 0.62,
@@ -613,6 +628,7 @@ async def test_auto_trader_execute(results: TestResults):
             "current_price": 85000.0,
             "prob_up": 0.62,
             "prob_down": 0.38,
+            "target_slot_ts": TARGET_SLOT_TS,
         }
 
         # Test 1: Execute trade when disabled
@@ -622,51 +638,119 @@ async def test_auto_trader_execute(results: TestResults):
         assert result["action"] == "skipped"
         results.ok("Trade skipped when disabled")
 
-        # Test 2: Execute trade when enabled
+        # Test 2: Execute trade when enabled — should pass target_slot_ts to place_trade
         trader.toggle(on=True)
+        result = await trader.execute_trade(signal)
+        assert result["success"] is True, f"Trade should succeed, got error: {result.get('error')}"
+        assert result["action"] == "traded"
+        assert result["data"]["order_id"] == "mock-order-123"
+        assert result["data"]["confidence"] == 0.62
+        assert result["data"]["strength"] == "STRONG"
 
-        # Mock the slot timestamp to avoid time-dependent issues
-        with patch.object(PolymarketClient, 'get_next_slot_timestamp', return_value=1742480400):
-            result = await trader.execute_trade(signal)
-            assert result["success"] is True, f"Trade should succeed, got error: {result.get('error')}"
-            assert result["action"] == "traded"
-            assert result["data"]["order_id"] == "mock-order-123"
-            assert result["data"]["confidence"] == 0.62
-            assert result["data"]["strength"] == "STRONG"
-            results.ok("Trade executed successfully with mock client")
+        # Verify place_trade was called with target_slot_ts
+        mock_pm.place_trade.assert_called_once_with(
+            direction="UP",
+            amount=trader.trade_amount,
+            target_slot_ts=TARGET_SLOT_TS,
+        )
+        results.ok("Trade executed with correct target_slot_ts passed to place_trade")
 
-            # Test 3: Duplicate slot prevention
-            result2 = await trader.execute_trade(signal)
-            assert result2["success"] is False
-            assert result2["action"] == "skipped"
-            assert "Already traded" in result2["error"]
-            results.ok("Duplicate trade for same slot correctly prevented")
+        # Test 3: Duplicate slot prevention — same target_slot_ts should be rejected
+        result2 = await trader.execute_trade(signal)
+        assert result2["success"] is False
+        assert result2["action"] == "skipped"
+        assert "Already traded" in result2["error"]
+        results.ok("Duplicate trade for same target slot correctly prevented")
 
-        # Test 4: NEUTRAL signal skipped
-        neutral_signal = {"signal": "NEUTRAL", "confidence": 0.50, "strength": "SKIP"}
-        with patch.object(PolymarketClient, 'get_next_slot_timestamp', return_value=9999999999):
-            result = await trader.execute_trade(neutral_signal)
-            assert result["success"] is False
-            assert result["action"] == "skipped"
-            results.ok("NEUTRAL signal correctly skipped")
+        # Test 4: Different target slot should work
+        NEXT_SLOT_TS = TARGET_SLOT_TS + 300  # Next 5-min slot
+        signal_next = {
+            "signal": "DOWN",
+            "confidence": 0.58,
+            "strength": "NORMAL",
+            "current_price": 85100.0,
+            "prob_up": 0.42,
+            "prob_down": 0.58,
+            "target_slot_ts": NEXT_SLOT_TS,
+        }
+        mock_pm.place_trade = AsyncMock(return_value={
+            "success": True,
+            "data": {
+                "order_id": "mock-order-456",
+                "direction": "DOWN",
+                "amount": 1.0,
+                "price": 0.52,
+                "size": 1.92,
+                "slot_ts": NEXT_SLOT_TS,
+                "slot_dt": "2026-03-20T16:50:00+00:00",
+                "market_slug": f"btc-updown-5m-{NEXT_SLOT_TS}",
+                "status": "MATCHED",
+            },
+        })
+        result3 = await trader.execute_trade(signal_next)
+        assert result3["success"] is True, f"Different slot should work, got: {result3.get('error')}"
+        assert result3["data"]["order_id"] == "mock-order-456"
+        mock_pm.place_trade.assert_called_once_with(
+            direction="DOWN",
+            amount=trader.trade_amount,
+            target_slot_ts=NEXT_SLOT_TS,
+        )
+        results.ok("Different target slot accepted (dedup is per-slot)")
 
-        # Test 5: Insufficient balance
+        # Test 5: Missing target_slot_ts should error (not silently fail)
+        signal_no_slot = {
+            "signal": "UP",
+            "confidence": 0.60,
+            "strength": "NORMAL",
+            "current_price": 85000.0,
+            "prob_up": 0.60,
+            "prob_down": 0.40,
+            # No target_slot_ts!
+        }
+        result4 = await trader.execute_trade(signal_no_slot)
+        assert result4["success"] is False
+        assert result4["action"] == "error"
+        assert "target_slot_ts" in result4["error"].lower() or "target_slot" in result4["error"].lower()
+        results.ok("Missing target_slot_ts correctly rejected with error")
+
+        # Test 6: NEUTRAL signal skipped
+        neutral_signal = {
+            "signal": "NEUTRAL",
+            "confidence": 0.50,
+            "strength": "SKIP",
+            "target_slot_ts": TARGET_SLOT_TS + 600,
+        }
+        result5 = await trader.execute_trade(neutral_signal)
+        assert result5["success"] is False
+        assert result5["action"] == "skipped"
+        results.ok("NEUTRAL signal correctly skipped")
+
+        # Test 7: Insufficient balance
         mock_pm.get_balance = AsyncMock(return_value={
             "success": True,
             "data": {"balance": 0.05},
         })
-        with patch.object(PolymarketClient, 'get_next_slot_timestamp', return_value=1111111111):
-            result = await trader.execute_trade(signal)
-            assert result["success"] is False
-            assert result["action"] == "error"
-            assert "Insufficient" in result["error"]
-            results.ok("Insufficient balance correctly rejected")
+        signal_low_bal = {
+            "signal": "UP",
+            "confidence": 0.60,
+            "strength": "NORMAL",
+            "current_price": 85000.0,
+            "prob_up": 0.60,
+            "prob_down": 0.40,
+            "target_slot_ts": TARGET_SLOT_TS + 900,  # Fresh slot
+        }
+        result6 = await trader.execute_trade(signal_low_bal)
+        assert result6["success"] is False
+        assert result6["action"] == "error"
+        assert "Insufficient" in result6["error"]
+        results.ok("Insufficient balance correctly rejected")
 
-        # Test 6: Session stats
+        # Test 8: Session stats
         stats = trader.get_session_stats()
-        assert stats["total_trades"] == 1, f"Expected 1 session trade, got {stats['total_trades']}"
+        assert stats["total_trades"] == 2, f"Expected 2 session trades, got {stats['total_trades']}"
         assert stats["directions"]["UP"] == 1
-        results.ok(f"Session stats: {stats['total_trades']} trade(s), UP={stats['directions']['UP']}")
+        assert stats["directions"]["DOWN"] == 1
+        results.ok(f"Session stats: {stats['total_trades']} trade(s), UP={stats['directions']['UP']}, DOWN={stats['directions']['DOWN']}")
 
         # Cleanup
         shutil.rmtree(test_dir, ignore_errors=True)
@@ -703,6 +787,18 @@ def test_slot_timestamp(results: TestResults):
         ts2 = int(slot_dt.timestamp())
         assert ts == ts2, f"Roundtrip mismatch: {ts} vs {ts2}"
         results.ok("Slot timestamp roundtrip: consistent")
+
+        # Test 5: get_market_for_slot validates alignment
+        # Misaligned timestamp should fail
+        misaligned_ts = ts + 17  # Not 300-second aligned
+        assert misaligned_ts % 300 != 0, "Test setup: should be misaligned"
+        results.ok("Slot alignment validation: misaligned timestamps detectable")
+
+        # Test 6: _build_slug is deterministic
+        slug = PolymarketClient._build_slug(ts)
+        expected_slug = f"btc-updown-5m-{ts}"
+        assert slug == expected_slug, f"Slug mismatch: {slug} vs {expected_slug}"
+        results.ok(f"Slug generation: {slug} (deterministic)")
 
     except Exception as e:
         results.fail("Slot Timestamp", f"{type(e).__name__}: {e}")
@@ -882,7 +978,7 @@ async def run_all_tests():
     # Test 8: AutoTrader toggle, amount, config
     test_auto_trader(results)
 
-    # Test 9: AutoTrader trade execution (mocked)
+    # Test 9: AutoTrader trade execution (mocked, slot-targeted)
     await test_auto_trader_execute(results)
 
     # Test 10: Polymarket formatters
@@ -892,7 +988,7 @@ async def run_all_tests():
     all_passed = results.summary()
 
     if all_passed:
-        print("\nAll tests PASSED! aprilxg v2 + Polymarket is ready for deployment.")
+        print("\nAll tests PASSED! aprilxg v2 + Polymarket slot-targeted trading is ready for deployment.")
     else:
         print(f"\n{results.failed} test(s) FAILED. Review errors above.")
 

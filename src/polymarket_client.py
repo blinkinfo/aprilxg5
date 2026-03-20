@@ -16,6 +16,13 @@ Market Discovery Strategy:
         GET https://gamma-api.polymarket.com/markets?slug=btc-updown-5m-{ts}
     This is 100% reliable — no keyword searching needed.
 
+Slot-Targeted Trading:
+    Signals predict the NEXT 5-min candle. The bot fires ~15 seconds before
+    the current candle closes, so at 16:44:45 UTC the signal is for the
+    16:45-16:50 slot. The target_slot_ts (Unix timestamp of 16:45:00) is
+    passed explicitly through the entire trade pipeline to ensure the order
+    lands on the correct Polymarket market.
+
 Order Sizing:
     OrderArgs.size = number of outcome shares (NOT USDC notional).
     To spend $5 USDC at price $0.50/share: size = 5.0 / 0.50 = 10.0 shares.
@@ -300,8 +307,95 @@ class PolymarketClient:
             "end_date": market.get("end_date_iso", market.get("endDate", market.get("end_date", ""))),
         }
 
+    async def get_market_for_slot(self, target_slot_ts: int) -> dict:
+        """Find the Polymarket 5-min BTC Up/Down market for a SPECIFIC slot.
+
+        This is the slot-targeted version of get_current_market(). Instead of
+        guessing which market to trade based on what's currently open, it looks
+        up the exact market for the given slot timestamp.
+
+        Args:
+            target_slot_ts: Unix timestamp of the target slot (must be 300s-aligned).
+                            Example: 1774025100 for the 16:45:00 UTC slot.
+
+        Returns:
+            {success: bool, data: {condition_id, up_token_id, down_token_id,
+             up_price, down_price, slot_ts, slot_dt, question, outcomes,
+             prices, neg_risk, ...}, error: str|None}
+        """
+        if not self._initialized:
+            return {"success": False, "data": None, "error": "Client not initialized"}
+
+        # Validate slot alignment
+        if target_slot_ts % SLOT_PERIOD != 0:
+            return {
+                "success": False,
+                "data": None,
+                "error": (
+                    f"target_slot_ts {target_slot_ts} is not aligned to "
+                    f"{SLOT_PERIOD}s boundary"
+                ),
+            }
+
+        try:
+            slug = self._build_slug(target_slot_ts)
+            slot_dt = self.slot_to_datetime(target_slot_ts)
+            logger.info(
+                f"Looking up target market: {slug} "
+                f"(slot {slot_dt.strftime('%H:%M:%S')} UTC)"
+            )
+
+            market_raw = await self._fetch_market_by_slug(slug)
+            if market_raw is None:
+                return {
+                    "success": False,
+                    "data": None,
+                    "error": (
+                        f"No market found for target slot "
+                        f"{slot_dt.strftime('%H:%M')} UTC (slug={slug}). "
+                        f"Market may not exist yet."
+                    ),
+                }
+
+            # Verify the market is not already closed/resolved
+            is_closed = market_raw.get("closed", False)
+            if is_closed:
+                return {
+                    "success": False,
+                    "data": None,
+                    "error": (
+                        f"Target market {slug} is already closed. "
+                        f"Slot {slot_dt.strftime('%H:%M')} UTC has ended."
+                    ),
+                }
+
+            # Parse market data
+            parsed = self._parse_market(market_raw, target_slot_ts)
+            if parsed is None:
+                return {
+                    "success": False,
+                    "data": None,
+                    "error": f"Failed to parse market data for {slug}",
+                }
+
+            logger.info(
+                f"Target market found: {parsed['question']} | "
+                f"slug={slug} | "
+                f"Up={parsed['up_token_id'][:16]}... (${parsed['up_price']}) | "
+                f"Down={parsed['down_token_id'][:16]}... (${parsed['down_price']})"
+            )
+            return {"success": True, "data": parsed, "error": None}
+
+        except Exception as e:
+            logger.error(f"Market discovery for slot {target_slot_ts} failed: {e}", exc_info=True)
+            return {"success": False, "data": None, "error": str(e)}
+
     async def get_current_market(self) -> dict:
         """Find the active Polymarket 5-min BTC Up/Down market to trade on.
+
+        NOTE: This is the LEGACY fallback method. For signal-driven trades,
+        use get_market_for_slot(target_slot_ts) instead, which guarantees
+        the order lands on the correct slot.
 
         Strategy:
             1. Try the CURRENT slot (floor to 300s) — this is the open, tradeable market.
@@ -402,8 +496,21 @@ class PolymarketClient:
     # Trade Execution
     # ------------------------------------------------------------------
 
-    async def place_trade(self, direction: str, amount: float) -> dict:
+    async def place_trade(
+        self,
+        direction: str,
+        amount: float,
+        target_slot_ts: Optional[int] = None,
+    ) -> dict:
         """Place a limit buy order on the correct Up/Down token.
+
+        When target_slot_ts is provided (the expected path for signal-driven
+        trades), the order is placed on that EXACT slot's market. This prevents
+        the bug where a signal for 16:45-16:50 accidentally trades on the
+        16:40-16:45 market that's still active.
+
+        When target_slot_ts is None (legacy fallback), falls back to
+        get_current_market() which guesses based on what's currently open.
 
         Order sizing:
             OrderArgs.size = number of outcome shares.
@@ -414,6 +521,9 @@ class PolymarketClient:
         Args:
             direction: "UP" or "DOWN"
             amount: Trade size in USDC
+            target_slot_ts: Unix timestamp of the target slot (300s-aligned).
+                            When provided, the order is placed on this exact
+                            slot's market. When None, falls back to auto-discovery.
 
         Returns:
             {success: bool, data: {order_id, direction, amount, price,
@@ -433,8 +543,20 @@ class PolymarketClient:
             )
             from py_clob_client.order_builder.constants import BUY
 
-            # Step 1: Discover the current market via deterministic slug
-            market_result = await self.get_current_market()
+            # Step 1: Discover the market
+            # Use slot-targeted lookup when target_slot_ts is provided (normal path).
+            # Fall back to auto-discovery only when no target slot is specified.
+            if target_slot_ts is not None:
+                slot_dt_str = self.slot_to_datetime(target_slot_ts).strftime('%H:%M:%S UTC')
+                logger.info(f"Using slot-targeted market discovery for slot {slot_dt_str}")
+                market_result = await self.get_market_for_slot(target_slot_ts)
+            else:
+                logger.warning(
+                    "No target_slot_ts provided — using legacy auto-discovery. "
+                    "This may trade the wrong slot!"
+                )
+                market_result = await self.get_current_market()
+
             if not market_result["success"]:
                 return {
                     "success": False,
@@ -445,7 +567,18 @@ class PolymarketClient:
             market = market_result["data"]
             slot_ts = market["slot_ts"]
 
-            # Step 2: Duplicate trade prevention
+            # Step 2: Verify we got the right slot (safety check)
+            if target_slot_ts is not None and slot_ts != target_slot_ts:
+                return {
+                    "success": False,
+                    "data": None,
+                    "error": (
+                        f"Slot mismatch! Requested slot {target_slot_ts} "
+                        f"but got market for slot {slot_ts}. Trade aborted."
+                    ),
+                }
+
+            # Step 3: Duplicate trade prevention (keyed to the TARGET slot)
             if self._last_traded_slot == slot_ts:
                 return {
                     "success": False,
@@ -453,7 +586,7 @@ class PolymarketClient:
                     "error": f"Duplicate trade prevented: already traded slot {market['slot_dt']}",
                 }
 
-            # Step 3: Pick the correct token based on signal direction
+            # Step 4: Pick the correct token based on signal direction
             if direction == "UP":
                 token_id = market["up_token_id"]
                 gamma_price = market["up_price"]
@@ -468,7 +601,7 @@ class PolymarketClient:
                     "error": f"No token ID found for direction={direction}",
                 }
 
-            # Step 4: Get best available price from CLOB order book
+            # Step 5: Get best available price from CLOB order book
             best_price = self.get_best_price(token_id, side="BUY")
             if best_price is None or best_price <= 0:
                 # Fall back to Gamma API price (from market discovery)
@@ -484,7 +617,7 @@ class PolymarketClient:
                         f"No price available anywhere, using default: {best_price}"
                     )
 
-            # Step 5: Calculate size (number of outcome shares)
+            # Step 6: Calculate size (number of outcome shares)
             # size = USDC amount / price per share
             # This means we spend: price * size = price * (amount/price) = amount USDC
             size = round(amount / best_price, 2)
@@ -496,7 +629,7 @@ class PolymarketClient:
                     "error": f"Invalid order size: {size} (amount={amount}, price={best_price})",
                 }
 
-            # Step 6: Build and place the order
+            # Step 7: Build and place the order
             neg_risk = market.get("neg_risk", False)
 
             logger.info(

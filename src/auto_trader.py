@@ -6,6 +6,15 @@ Manages:
 - Signal-to-trade pipeline with safety checks
 - Balance verification before each trade
 - Duplicate trade prevention per 5-min slot
+
+Slot-Targeted Trading:
+    Signals include a target_slot_ts (Unix timestamp) identifying which exact
+    5-min slot the prediction is for. This is passed through the entire pipeline
+    to ensure the Polymarket order lands on the correct market.
+
+    Example: Signal fires at 16:44:45 for the 16:45-16:50 slot.
+    target_slot_ts = 1774025100 (Unix ts of 16:45:00 UTC).
+    This ensures we trade the 16:45 market, NOT the 16:40 market.
 """
 import json
 import logging
@@ -159,6 +168,10 @@ class AutoTrader:
         Called by the bot after a signal is generated. Performs all safety checks
         then delegates to PolymarketClient.place_trade().
 
+        The signal dict MUST include target_slot_ts (Unix timestamp) to ensure
+        the trade lands on the correct Polymarket market. This is the slot the
+        model is predicting (the NEXT candle), not the current one.
+
         Args:
             signal: Prediction dict with keys:
                 - signal: "UP", "DOWN", or "NEUTRAL"
@@ -167,6 +180,7 @@ class AutoTrader:
                 - current_price: float (BTC price)
                 - prob_up: float
                 - prob_down: float
+                - target_slot_ts: int (Unix timestamp of the target 5-min slot)
 
         Returns:
             {success: bool, action: str, data: dict|None, error: str|None}
@@ -174,6 +188,7 @@ class AutoTrader:
         direction = signal.get("signal", "NEUTRAL")
         confidence = signal.get("confidence", 0)
         strength = signal.get("strength", "SKIP")
+        target_slot_ts = signal.get("target_slot_ts")
 
         # --- Safety Check 1: Is auto-trading enabled? ---
         if not self.enabled:
@@ -202,17 +217,33 @@ class AutoTrader:
                 "error": "Polymarket client not initialized",
             }
 
-        # --- Safety Check 4: Duplicate slot prevention ---
-        current_slot = PolymarketClient.get_current_slot_timestamp()
-        if self._last_traded_slot == current_slot:
+        # --- Safety Check 4: Do we have a valid target slot? ---
+        if target_slot_ts is None:
+            return {
+                "success": False,
+                "action": "error",
+                "data": None,
+                "error": (
+                    "No target_slot_ts in signal. Cannot determine which "
+                    "Polymarket market to trade. This is a bug."
+                ),
+            }
+
+        # --- Safety Check 5: Duplicate slot prevention ---
+        # Keyed to the TARGET slot (the one we're predicting), not the current time
+        if self._last_traded_slot == target_slot_ts:
+            slot_dt = PolymarketClient.slot_to_datetime(target_slot_ts)
             return {
                 "success": False,
                 "action": "skipped",
-                "data": {"slot_ts": current_slot},
-                "error": f"Already traded this slot ({PolymarketClient.slot_to_datetime(current_slot).strftime('%H:%M')} UTC)",
+                "data": {"slot_ts": target_slot_ts},
+                "error": (
+                    f"Already traded target slot "
+                    f"{slot_dt.strftime('%H:%M')} UTC"
+                ),
             }
 
-        # --- Safety Check 5: Sufficient balance ---
+        # --- Safety Check 6: Sufficient balance ---
         bal_result = await self._pm.get_balance()
         if not bal_result["success"]:
             return {
@@ -232,19 +263,22 @@ class AutoTrader:
             }
 
         # --- Execute Trade ---
+        slot_dt = PolymarketClient.slot_to_datetime(target_slot_ts)
         logger.info(
             f"Executing trade: {direction} | conf={confidence:.4f} | "
-            f"strength={strength} | amount={self.trade_amount} USDC"
+            f"strength={strength} | amount={self.trade_amount} USDC | "
+            f"target_slot={slot_dt.strftime('%H:%M:%S')} UTC"
         )
 
         trade_result = await self._pm.place_trade(
             direction=direction,
             amount=self.trade_amount,
+            target_slot_ts=target_slot_ts,
         )
 
         if trade_result["success"]:
-            # Mark slot as traded
-            self._last_traded_slot = current_slot
+            # Mark target slot as traded (prevents duplicate trades for this slot)
+            self._last_traded_slot = target_slot_ts
 
             # Enrich trade data with signal info
             trade_data = trade_result["data"]

@@ -13,6 +13,8 @@ Fixes applied:
 - Startup resolves any stale pending signals from prior sessions
 - All timestamps in UTC
 - Training now uses full paginated historical data for ALL timeframes (5m, 15m, 1h)
+- Auto-trade now passes target_slot_ts through the entire pipeline to ensure
+  orders land on the correct Polymarket market (not the current/closing one)
 
 UI/UX v2:
 - All message formatting delegated to formatters module
@@ -278,8 +280,24 @@ class SignalBot:
                 )
 
                 # --- Polymarket Auto-Trade (purely additive) ---
+                # Pass the target slot timestamp so the trade pipeline places
+                # the order on the CORRECT Polymarket market.
+                # next_slot is the candle we're predicting (e.g. 16:45:00).
+                # Convert to Unix timestamp for Polymarket slug lookup.
                 if self.auto_trader and self.auto_trader.enabled:
                     try:
+                        # Ensure next_slot is timezone-aware for correct Unix ts
+                        if next_slot.tzinfo is None:
+                            next_slot_aware = next_slot.replace(tzinfo=timezone.utc)
+                        else:
+                            next_slot_aware = next_slot
+                        prediction["target_slot_ts"] = int(next_slot_aware.timestamp())
+
+                        logger.info(
+                            f"Auto-trade: targeting slot {next_slot_iso} "
+                            f"(ts={prediction['target_slot_ts']})"
+                        )
+
                         trade_result = await self.auto_trader.execute_trade(prediction)
                         if trade_result["success"]:
                             trade_msg = formatters.format_trade_execution(trade_result["data"])
