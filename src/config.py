@@ -97,6 +97,10 @@ class PolymarketConfig:
     funder_address: str = ""       # Funder/proxy wallet address
     signature_type: int = 2        # Signature type (0, 1, or 2)
     enabled: bool = False           # Derived: True if private_key is set
+    # Position redemption settings
+    polygon_rpc_url: str = ""      # Polygon RPC URL (defaults to public RPC if empty)
+    auto_redeem: bool = True       # Automatically redeem resolved positions
+    redeem_check_interval: int = 120  # Seconds between redemption scans
 
 
 @dataclass
@@ -154,6 +158,12 @@ class BotConfig:
         config.polymarket.funder_address = os.environ.get("POLYMARKET_FUNDER_ADDRESS", "")
         if os.environ.get("POLYMARKET_SIGNATURE_TYPE"):
             config.polymarket.signature_type = int(os.environ["POLYMARKET_SIGNATURE_TYPE"])
+        # Position redemption settings
+        config.polymarket.polygon_rpc_url = os.environ.get("POLYGON_RPC_URL", "")
+        if os.environ.get("POLYMARKET_AUTO_REDEEM"):
+            config.polymarket.auto_redeem = os.environ["POLYMARKET_AUTO_REDEEM"].lower() in ("1", "true", "yes")
+        if os.environ.get("POLYMARKET_REDEEM_INTERVAL"):
+            config.polymarket.redeem_check_interval = int(os.environ["POLYMARKET_REDEEM_INTERVAL"])
         # Derived flag: Polymarket is enabled if private key is provided
         config.polymarket.enabled = bool(config.polymarket.private_key)
 
@@ -166,7 +176,8 @@ class BotConfig:
             f"confidence_min={config.model.confidence_min}, "
             f"optuna={'ON' if config.model.enable_optuna_tuning else 'OFF'} "
             f"({config.model.optuna_n_trials} trials, {config.model.optuna_timeout_seconds}s timeout), "
-            f"polymarket={pm_status}"
+            f"polymarket={pm_status}, "
+            f"auto_redeem={'ON' if config.polymarket.auto_redeem else 'OFF'}"
         )
 
         return config

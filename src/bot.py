@@ -35,6 +35,7 @@ from .telegram_bot import TelegramBot
 from . import formatters
 from .polymarket_client import PolymarketClient
 from .auto_trader import AutoTrader
+from .position_redeemer import PositionRedeemer
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +82,8 @@ class SignalBot:
         # Polymarket auto-trading (initialized in start() if configured)
         self.polymarket_client = None
         self.auto_trader = None
+        self.position_redeemer = None
+        self._last_redeem_check_ts = 0.0
 
     async def start(self):
         """Start the bot."""
@@ -104,6 +107,7 @@ class SignalBot:
             balance_cb=self._get_balance_text,
             positions_cb=self._get_positions_text,
             pmstatus_cb=self._get_pmstatus_text,
+            redeem_cb=self._redeem_positions_text,
         )
         await self.telegram.start_polling()
 
@@ -130,6 +134,28 @@ class SignalBot:
                 self.polymarket_client = None
         else:
             logger.info("Polymarket integration disabled (no POLYMARKET_PRIVATE_KEY)")
+
+            # Initialize position redeemer for auto-redeeming resolved markets
+            if self.config.polymarket.auto_redeem:
+                self.position_redeemer = PositionRedeemer(
+                    private_key=self.config.polymarket.private_key,
+                    funder_address=self.config.polymarket.funder_address,
+                    signature_type=self.config.polymarket.signature_type,
+                    polygon_rpc_url=self.config.polymarket.polygon_rpc_url,
+                )
+                redeem_init = await self.position_redeemer.initialize()
+                if redeem_init["success"]:
+                    matic = redeem_init["data"]["matic_balance"]
+                    logger.info(f"PositionRedeemer ready (MATIC: {matic:.4f})")
+                    await self.telegram.send_message(
+                        formatters.format_redeem_status(
+                            self.position_redeemer.get_stats(),
+                            redeemer_initialized=True,
+                        )
+                    )
+                else:
+                    logger.error(f"PositionRedeemer init failed: {redeem_init['error']}")
+                    self.position_redeemer = None
 
         # Try loading existing model
         loaded = self.model.load(self.config.model_dir)
@@ -168,6 +194,8 @@ class SignalBot:
         await self.telegram.stop()
         if self.polymarket_client:
             await self.polymarket_client.close()
+        if self.position_redeemer:
+            await self.position_redeemer.close()
         await self.fetcher.close()
         self.model.save(self.config.model_dir)
         logger.info("Bot stopped")
@@ -211,6 +239,21 @@ class SignalBot:
                 if self.model.needs_retrain():
                     logger.info("Model retrain interval reached")
                     await self._train_model()
+
+                # --- REDEEM: Periodically scan for redeemable positions ---
+                if self.position_redeemer and self.position_redeemer.is_initialized:
+                    import time as _time
+                    now_ts = _time.time()
+                    if now_ts - self._last_redeem_check_ts >= self.config.polymarket.redeem_check_interval:
+                        self._last_redeem_check_ts = now_ts
+                        try:
+                            result = await self.position_redeemer.redeem_all()
+                            if result["redeemed"] or result["errors"]:
+                                await self.telegram.send_message(
+                                    formatters.format_redemption_result(result)
+                                )
+                        except Exception as e:
+                            logger.error(f"Redemption scan error: {e}")
 
                 await asyncio.sleep(self.config.main_loop_interval)
 
@@ -639,6 +682,17 @@ class SignalBot:
             session_trades=config.get("session_trades", 0),
             error=health.get("error"),
         )
+
+    async def _redeem_positions_text(self) -> str:
+        """Callback for /redeem command — manually trigger redemption."""
+        if not self.position_redeemer or not self.position_redeemer.is_initialized:
+            return formatters.format_redeem_status({}, redeemer_initialized=False)
+        try:
+            result = await self.position_redeemer.redeem_all()
+            return formatters.format_redemption_result(result)
+        except Exception as e:
+            logger.error(f"Manual redemption error: {e}")
+            return formatters.format_redeem_error(str(e))
 
 
 async def run_bot():

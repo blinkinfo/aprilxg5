@@ -848,3 +848,84 @@ def format_pm_not_configured() -> str:
         "to enable Polymarket trading features.\n\n"
         "See /help for details."
     )
+
+
+# ---------------------------------------------------------------------------
+# Position Redemption Formatters
+# ---------------------------------------------------------------------------
+
+def format_redemption_result(result: dict) -> str:
+    """Format the result of a batch redemption scan."""
+    redeemed = result.get("redeemed", [])
+    errors = result.get("errors", [])
+    total_usdc = result.get("total_usdc", 0)
+
+    if not redeemed and not errors:
+        return (
+            "<b>&#128270; Redemption Scan</b>\n\n"
+            "No redeemable positions found.\n"
+            "Resolved positions are auto-scanned every 2 minutes."
+        )
+
+    lines = ["<b>&#128176; Position Redemption</b>\n"]
+
+    if redeemed:
+        lines.append(f"<b>Redeemed: {len(redeemed)}</b>")
+        for r in redeemed:
+            title = _escape_html(r.get("title", "Unknown")[:50])
+            size = r.get("size", 0)
+            tx = r.get("tx_hash", "")
+            tx_short = tx[:10] + "..." if tx else "n/a"
+            neg = " [NegRisk]" if r.get("neg_risk") else ""
+            lines.append(
+                f"  &#9989; <b>{title}</b>{neg}\n"
+                f"     Size: {size:.4f} USDC | "
+                f'<a href="https://polygonscan.com/tx/{tx}">Tx: {tx_short}</a>'
+            )
+        lines.append(f"\n<b>Total USDC redeemed: ${total_usdc:.4f}</b>")
+
+    if errors:
+        lines.append(f"\n<b>Errors: {len(errors)}</b>")
+        for e in errors:
+            title = _escape_html(e.get("title", "Unknown")[:50])
+            err_msg = _escape_html(str(e.get("error", "Unknown error"))[:100])
+            lines.append(f"  &#10060; {title}: {err_msg}")
+
+    return "\n".join(lines)
+
+
+def format_redeem_status(stats: dict, redeemer_initialized: bool) -> str:
+    """Format redemption system status."""
+    if not redeemer_initialized:
+        return (
+            "<b>&#128176; Redemption Status</b>\n\n"
+            "Redeemer not initialized.\n"
+            "Set POLYGON_RPC_URL to enable on-chain redemption."
+        )
+
+    total = stats.get("total_redeemed", 0)
+    total_usdc = stats.get("total_usdc", 0)
+    last_scan = stats.get("last_scan")
+
+    import time
+    if last_scan:
+        ago = int(time.time() - last_scan)
+        scan_str = f"{ago}s ago"
+    else:
+        scan_str = "Never"
+
+    return (
+        "<b>&#128176; Redemption Status</b>\n\n"
+        f"Status: &#9989; Active\n"
+        f"Session redeemed: {total} positions\n"
+        f"Session USDC: ${total_usdc:.4f}\n"
+        f"Last scan: {scan_str}"
+    )
+
+
+def format_redeem_error(error: str) -> str:
+    """Format a redemption error message."""
+    return (
+        "<b>&#10060; Redemption Error</b>\n\n"
+        f"{_escape_html(error)}"
+    )

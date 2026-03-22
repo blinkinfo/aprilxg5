@@ -53,6 +53,7 @@ _BOT_COMMANDS = [
     BotCommand("balance", "Check Polymarket USDC balance"),
     BotCommand("positions", "View open Polymarket positions"),
     BotCommand("pmstatus", "Full Polymarket connection status"),
+    BotCommand("redeem", "Redeem resolved Polymarket positions"),
 ]
 
 
@@ -85,6 +86,7 @@ class TelegramBot:
         balance_cb: Optional[Callable[[], Awaitable[str]]] = None,
         positions_cb: Optional[Callable[[], Awaitable[str]]] = None,
         pmstatus_cb: Optional[Callable[[], Awaitable[str]]] = None,
+        redeem_cb: Optional[Callable[[], Awaitable[str]]] = None,
     ):
         """Set callback functions for bot commands."""
         self._stats_callback = stats_cb
@@ -96,6 +98,7 @@ class TelegramBot:
         self._balance_callback = balance_cb
         self._positions_callback = positions_cb
         self._pmstatus_callback = pmstatus_cb
+        self._redeem_cb = redeem_cb
 
     async def initialize(self):
         """Initialize the bot, register handlers, and set menu commands."""
@@ -123,6 +126,8 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("balance", self._cmd_balance))
         self.application.add_handler(CommandHandler("positions", self._cmd_positions))
         self.application.add_handler(CommandHandler("pmstatus", self._cmd_pmstatus))
+        # Redemption command
+        self.application.add_handler(CommandHandler("redeem", self._handle_redeem))
 
         await self.application.initialize()
 
@@ -344,3 +349,12 @@ class TelegramBot:
         else:
             text = formatters.format_pm_not_configured()
         await update.message.reply_text(text, parse_mode="HTML")
+
+    async def _handle_redeem(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /redeem command — trigger manual position redemption."""
+        if self._redeem_cb:
+            await update.message.reply_text("Scanning for redeemable positions...", parse_mode="HTML")
+            text = await self._redeem_cb()
+            await update.message.reply_text(text, parse_mode="HTML")
+        else:
+            await update.message.reply_text("Position redemption is not available.", parse_mode="HTML")
