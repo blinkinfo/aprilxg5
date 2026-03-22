@@ -283,7 +283,7 @@ class PositionRedeemer:
         if neg_risk:
             # NegRisk markets: call NegRiskAdapter.redeemPositions(conditionId, indexSets)
             calldata = self._neg_risk_adapter.encode_abi(
-                fn_name="redeemPositions",
+                "redeemPositions",
                 args=[condition_bytes, index_sets],
             )
             target = NEG_RISK_ADAPTER_ADDRESS
@@ -291,7 +291,7 @@ class PositionRedeemer:
             # Standard markets: call CTF.redeemPositions(collateral, parent, conditionId, indexSets)
             parent_collection = b"\x00" * 32
             calldata = self._ctf.encode_abi(
-                fn_name="redeemPositions",
+                "redeemPositions",
                 args=[USDC_E_ADDRESS, parent_collection, condition_bytes, index_sets],
             )
             target = CTF_ADDRESS
@@ -370,7 +370,7 @@ class PositionRedeemer:
 
         # Encode the execTransaction call
         exec_calldata = self._safe_contract.encode_abi(
-            fn_name="execTransaction",
+            "execTransaction",
             args=[
                 Web3.to_checksum_address(target),  # to
                 0,                                  # value
