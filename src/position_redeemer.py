@@ -187,7 +187,7 @@ class PositionRedeemer:
             self._initialized = True
             logger.info(
                 f"PositionRedeemer initialized: EOA={self._eoa_address}, "
-                f"Safe={self._funder_address}, MATIC={matic_balance:.4f}, "
+                f"Safe={self._funder_address}, POL={matic_balance:.4f}, "
                 f"RPC={self._polygon_rpc_url}"
             )
 
@@ -543,13 +543,13 @@ class PositionRedeemer:
         # Step 2: Check MATIC balance for gas
         eoa_balance = self._w3.eth.get_balance(self._eoa_address)
         matic_balance = self._w3.from_wei(eoa_balance, "ether")
-        if matic_balance < 0.005:  # Need at least ~0.005 MATIC for gas
+        if matic_balance < 0.005:  # Need at least ~0.005 POL for gas
             return {
                 "success": False,
                 "redeemed": [],
                 "skipped": len(positions),
                 "errors": [{
-                    "error": f"Insufficient MATIC for gas: {matic_balance:.6f} MATIC"
+                    "error": f"Insufficient POL for gas: {matic_balance:.6f} POL"
                 }],
                 "total_usdc": 0.0,
             }

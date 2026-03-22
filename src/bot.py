@@ -146,7 +146,7 @@ class SignalBot:
                 redeem_init = await self.position_redeemer.initialize()
                 if redeem_init["success"]:
                     matic = redeem_init["data"]["matic_balance"]
-                    logger.info(f"PositionRedeemer ready (MATIC: {matic:.4f})")
+                    logger.info(f"PositionRedeemer ready (POL: {matic:.4f})")
                     await self.telegram.send_message(
                         formatters.format_redeem_status(
                             self.position_redeemer.get_stats(),
