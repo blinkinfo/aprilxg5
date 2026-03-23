@@ -626,6 +626,8 @@ def format_retrain_comparison(comparison: dict) -> str:
     n_features = comparison.get("new_n_features", 0)
     optuna = comparison.get("optuna_tuned", False)
     has_existing = comparison.get("has_existing_model", False)
+    old_recent = comparison.get("old_recent_accuracy", 0)
+    new_recent = comparison.get("new_recent_accuracy", 0)
 
     if improvement > 0:
         delta_icon = "\U0001f7e2"  # green circle
@@ -645,9 +647,11 @@ def format_retrain_comparison(comparison: dict) -> str:
     if has_existing:
         lines.append(f"           Old       New")
         lines.append(f"Val Acc    {old_acc:.1%}     {new_acc:.1%}  {delta_icon} {improvement:+.1%}")
+        lines.append(f"Recent288  {old_recent:.1%}     {new_recent:.1%}")
         lines.append(f"Log Loss   {old_logloss:.4f}    {new_logloss:.4f}")
     else:
         lines.append(f"Val Acc    {new_acc:.1%}  (first model)")
+        lines.append(f"Recent288  {new_recent:.1%}")
         lines.append(f"Log Loss   {new_logloss:.4f}")
 
     lines.append(f"CV Acc     {new_cv:.1%}")

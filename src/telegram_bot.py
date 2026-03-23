@@ -307,11 +307,13 @@ class TelegramBot:
                             "\U0001f6e1\ufe0f  Keep Old Model",
                             callback_data="retrain_keep",
                         ),
+                    ],
+                    [
                         InlineKeyboardButton(
                             "\u2705  Swap to New Model",
                             callback_data="retrain_swap",
                         ),
-                    ]
+                    ],
                 ])
                 await update.message.reply_text(
                     text,

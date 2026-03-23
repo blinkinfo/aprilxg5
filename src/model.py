@@ -425,6 +425,22 @@ class PredictionModel:
         new_val_acc = accuracy_score(y_val_final, val_pred)
         new_val_logloss = log_loss(y_val_final, val_proba)
 
+        # --- Recent 288 candles accuracy (last 24h of 5m data) ---
+        recent_n = min(288, len(X))
+        X_recent = X.iloc[-recent_n:]
+        y_recent = y.iloc[-recent_n:]
+
+        # New candidate accuracy on recent window
+        new_recent_preds = candidate.predict(X_recent)
+        new_recent_acc = accuracy_score(y_recent, new_recent_preds)
+
+        # Old model accuracy on recent window (if exists)
+        if self.model is not None:
+            old_recent_preds = self.model.predict(X_recent[self.feature_names])
+            old_recent_acc = accuracy_score(y_recent, old_recent_preds)
+        else:
+            old_recent_acc = 0.0
+
         # Store as pending (do NOT swap yet)
         self._pending_model = candidate
         self._pending_metrics = {
@@ -452,6 +468,8 @@ class PredictionModel:
             "new_cv_accuracy": avg_cv,
             "new_total_samples": len(X),
             "new_n_features": len(self.feature_names),
+            "old_recent_accuracy": old_recent_acc,
+            "new_recent_accuracy": new_recent_acc,
             "improvement": new_val_acc - self.val_accuracy,
             "optuna_tuned": self.best_xgb_params is not None,
             "has_existing_model": self.model is not None,
@@ -459,7 +477,8 @@ class PredictionModel:
 
         logger.info(
             f"Candidate ready: new_val_acc={new_val_acc:.4f} vs "
-            f"current={self.val_accuracy:.4f} (delta={comparison['improvement']:+.4f})"
+            f"current={self.val_accuracy:.4f} (delta={comparison['improvement']:+.4f}) "
+            f"| recent_288: new={new_recent_acc:.4f} old={old_recent_acc:.4f}"
         )
         return comparison
 
