@@ -21,6 +21,11 @@ Fixes applied (v6 — bug fixes):
 - Fix: Retrain loop — last_train_time updated even when retrain gate rejects,
   preventing infinite retrain attempts.
 
+Improvements (v7 — calibration, EV filtering, feature pruning):
+- Improvement: Isotonic regression calibration on OOS split for honest probabilities.
+- Improvement: EV-based trade filtering — only trade when expected value >= threshold.
+- Improvement: Feature pruning — keep top N features by importance, retrain.
+
 Prior improvements preserved:
 - Improvement 2: Confidence filtering — skip low-confidence predictions
 - Improvement 4: Walk-forward retraining gate — only swap model if new one is better
@@ -36,6 +41,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import accuracy_score, log_loss
 from xgboost import XGBClassifier
@@ -70,6 +76,10 @@ class PredictionModel:
         self._n_train_samples: int = 0
         self.train_end_ts: Optional[datetime] = None  # Tracks end of training data window
 
+        # Calibration and feature pruning state (v7)
+        self.calibrator = None  # Isotonic regression calibrator
+        self.pruned_feature_names = None  # Feature names after pruning
+
         # Interactive retrain state (train_for_comparison / apply / reject)
         self._pending_model: Optional[XGBClassifier] = None
         self._pending_feature_names: list[str] = []
@@ -80,6 +90,8 @@ class PredictionModel:
         self._pending_oos_metrics: Optional[dict] = None
         self._pending_xgb_params: Optional[dict] = None
         self._pending_train_end_ts: Optional[datetime] = None
+        self._pending_calibrator = None  # Pending calibrator (v7)
+        self._pending_pruned_feature_names = None  # Pending pruned features (v7)
 
         # One-shot force-tune flag
         self._force_tune_flag: bool = False
@@ -124,6 +136,9 @@ class PredictionModel:
             "val_accuracy": self.val_accuracy,
             "n_train_samples": self._n_train_samples,
             "train_end_ts": self.train_end_ts,
+            # v7: calibration and feature pruning state
+            "calibrator": self.calibrator,
+            "pruned_feature_names": self.pruned_feature_names,
         }
         with open(path, "wb") as f:
             pickle.dump(state, f)
@@ -151,10 +166,15 @@ class PredictionModel:
             self.val_accuracy = state.get("val_accuracy", 0.0)
             self._n_train_samples = state.get("n_train_samples", 0)
             self.train_end_ts = state.get("train_end_ts")
+            # v7: load calibration and pruning state (backward compatible)
+            self.calibrator = state.get("calibrator", None)
+            self.pruned_feature_names = state.get("pruned_feature_names", None)
             logger.info(
                 f"Model loaded from {path} | "
                 f"val_accuracy={self.val_accuracy:.4f} | "
-                f"features={len(self.feature_names)}"
+                f"features={len(self.feature_names)} | "
+                f"pruned={'yes (' + str(len(self.pruned_feature_names)) + ')' if self.pruned_feature_names else 'no'} | "
+                f"calibrated={'yes' if self.calibrator is not None else 'no'}"
             )
             return True
         except Exception as e:
@@ -392,8 +412,17 @@ class PredictionModel:
         X_val: pd.DataFrame,
         y_val: pd.Series,
         label: str = "OOS",
+        calibrator=None,
     ) -> dict:
-        """Log detailed, honest validation metrics."""
+        """Log detailed, honest validation metrics.
+
+        Args:
+            model: Trained XGBClassifier.
+            X_val: Validation features.
+            y_val: Validation labels.
+            label: Label for log messages.
+            calibrator: Optional IsotonicRegression calibrator for calibrated metrics.
+        """
         preds = model.predict(X_val)
         proba = model.predict_proba(X_val)
         confidence = np.max(proba, axis=1)
@@ -443,6 +472,24 @@ class PredictionModel:
             f"Log loss: {f'{ll:.4f}' if ll is not None else 'N/A'} | "
             f"Samples: {len(y_val)}"
         )
+
+        # v7: Calibrated metrics
+        if calibrator is not None:
+            try:
+                cal_proba = calibrator.predict(proba[:, 1])
+                cal_preds = (cal_proba > 0.5).astype(int)
+                cal_acc = accuracy_score(y_val, cal_preds)
+                # Compute EV stats
+                cal_proba_correct = np.where(cal_preds == y_val, cal_proba, 1 - cal_proba)
+                ev_per_trade = cal_proba_correct * 0.96 - (1 - cal_proba_correct) * 1.0
+                logger.info(
+                    f"[{label}] Calibrated accuracy: {cal_acc:.4f} | "
+                    f"Avg EV per trade: ${np.mean(ev_per_trade):.4f}"
+                )
+                metrics["calibrated_accuracy"] = cal_acc
+                metrics["avg_ev_per_trade"] = float(np.mean(ev_per_trade))
+            except Exception as e:
+                logger.warning(f"Calibrated metrics failed: {e}")
 
         return metrics
 
@@ -505,23 +552,82 @@ class PredictionModel:
         candidate_model.fit(X_inner, y_inner, verbose=False)
 
         # ----------------------------------------------------------
+        # Step 2b: Feature Pruning (v7)
+        # ----------------------------------------------------------
+        pruned_feature_names = None
+        feature_pruned = False
+        X_oos_for_metrics = X_oos  # Default: use full features for OOS metrics
+
+        if self.config.enable_feature_pruning:
+            importances = candidate_model.feature_importances_
+            top_n = min(self.config.feature_prune_top_n, len(importances))
+            top_indices = np.argsort(importances)[-top_n:]
+            pruned_feature_names = [feature_names[i] for i in sorted(top_indices)]
+            feature_pruned = True
+
+            logger.info(
+                f"Feature pruning: {len(feature_names)} -> {len(pruned_feature_names)} features "
+                f"(top {top_n} by importance)"
+            )
+
+            # Retrain candidate on pruned features
+            X_inner_pruned = X_inner[pruned_feature_names]
+            X_oos_pruned = X_oos[pruned_feature_names]
+            X_oos_for_metrics = X_oos_pruned
+
+            candidate_model = XGBClassifier(**xgb_params)
+            candidate_model.fit(
+                X_inner_pruned, y_inner,
+                eval_set=[(X_oos_pruned, y_oos)],
+                verbose=False,
+            )
+        else:
+            # No pruning — use all features
+            pruned_feature_names = list(feature_names)
+
+        # ----------------------------------------------------------
+        # Step 2c: Probability Calibration (v7)
+        # ----------------------------------------------------------
+        calibrator = None
+
+        if self.config.enable_calibration:
+            raw_proba_oos = candidate_model.predict_proba(X_oos_for_metrics)[:, 1]  # P(UP)
+
+            calibrator = IsotonicRegression(out_of_bounds='clip')
+            calibrator.fit(raw_proba_oos, y_oos)
+
+            # Log calibration quality
+            cal_proba_oos = calibrator.predict(raw_proba_oos)
+            cal_mean = float(np.mean(cal_proba_oos))
+            raw_mean = float(np.mean(raw_proba_oos))
+            logger.info(
+                f"Calibration fitted on OOS: raw_mean_prob={raw_mean:.4f}, "
+                f"calibrated_mean_prob={cal_mean:.4f}"
+            )
+
+        # ----------------------------------------------------------
         # Step 3: Honest OOS validation (Fix F)
         # ----------------------------------------------------------
         logger.info(f"Validating on truly held-out OOS split ({len(X_oos)} samples)")
-        oos_metrics = self._log_honest_metrics(candidate_model, X_oos, y_oos, label="OOS-holdout")
+        oos_metrics = self._log_honest_metrics(
+            candidate_model, X_oos_for_metrics, y_oos,
+            label="OOS-holdout", calibrator=calibrator,
+        )
         new_val_accuracy = oos_metrics["accuracy"]
 
         # Cross-validation on inner for comparison logging
+        # Use pruned features for CV if pruning is enabled
+        X_inner_cv = X_inner[pruned_feature_names] if feature_pruned else X_inner
         tscv = TimeSeriesSplit(n_splits=5)
         cv_scores = []
-        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X_inner)):
+        for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X_inner_cv)):
             if len(train_idx) > PURGE_GAP:
                 train_idx = train_idx[:-PURGE_GAP]
             else:
                 continue
-            X_tr = X_inner.iloc[train_idx]
+            X_tr = X_inner_cv.iloc[train_idx]
             y_tr = y_inner.iloc[train_idx]
-            X_va = X_inner.iloc[val_idx]
+            X_va = X_inner_cv.iloc[val_idx]
             y_va = y_inner.iloc[val_idx]
             if len(X_tr) < 100 or len(X_va) < 50:
                 continue
@@ -541,19 +647,21 @@ class PredictionModel:
 
         # OOS log loss for comparison display
         try:
-            oos_proba = candidate_model.predict_proba(X_oos)
+            oos_proba = candidate_model.predict_proba(X_oos_for_metrics)
             oos_logloss = log_loss(y_oos, oos_proba)
         except Exception:
             oos_logloss = 0.0
 
         # ----------------------------------------------------------
         # Step 4: Train PRODUCTION model on ALL data (Fix G)
+        # Uses pruned features if pruning is enabled.
         # ----------------------------------------------------------
-        logger.info(f"Training PRODUCTION model on ALL {n_total} samples")
+        X_prod = X[pruned_feature_names] if feature_pruned else X
+        logger.info(f"Training PRODUCTION model on ALL {n_total} samples ({len(X_prod.columns)} features)")
         production_model = XGBClassifier(**xgb_params)
-        production_model.fit(X, y, verbose=False)
+        production_model.fit(X_prod, y, verbose=False)
 
-        train_preds = production_model.predict(X)
+        train_preds = production_model.predict(X_prod)
         train_acc = accuracy_score(y, train_preds)
         logger.info(f"Production model train accuracy (full data): {train_acc:.4f}")
 
@@ -572,9 +680,9 @@ class PredictionModel:
 
         # Recent-288 accuracy (last 288 OOS samples = ~24h at 5m)
         recent_288_acc = 0.0
-        if len(X_oos) > 0:
-            tail = min(288, len(X_oos))
-            X_recent = X_oos.iloc[-tail:]
+        if len(X_oos_for_metrics) > 0:
+            tail = min(288, len(X_oos_for_metrics))
+            X_recent = X_oos_for_metrics.iloc[-tail:]
             y_recent = y_oos.iloc[-tail:]
             recent_preds = candidate_model.predict(X_recent)
             recent_288_acc = accuracy_score(y_recent, recent_preds)
@@ -583,6 +691,8 @@ class PredictionModel:
             "production_model": production_model,
             "candidate_model": candidate_model,
             "feature_names": feature_names,
+            "pruned_feature_names": pruned_feature_names,
+            "calibrator": calibrator,
             "xgb_params": xgb_params,
             "n_total": n_total,
             "n_inner": len(X_inner),
@@ -597,6 +707,9 @@ class PredictionModel:
             "recent_288_acc": recent_288_acc,
             "optuna_tuned": xgb_params != dict(self.config.xgb_params),
             "train_end_ts": train_end_ts,
+            "feature_pruned": feature_pruned,
+            "n_pruned_features": len(pruned_feature_names),
+            "n_original_features": len(feature_names),
         }
 
     # ------------------------------------------------------------------
@@ -674,6 +787,9 @@ class PredictionModel:
         self._n_train_samples = n_total
         self.train_end_ts = result["train_end_ts"]
         self.last_train_time = datetime.now(timezone.utc)
+        # v7: Install calibrator and pruned feature names
+        self.calibrator = result.get("calibrator")
+        self.pruned_feature_names = result.get("pruned_feature_names")
 
         self.save()
 
@@ -681,7 +797,9 @@ class PredictionModel:
         logger.info(
             f"TRAINING COMPLETE | OOS accuracy={new_val_accuracy:.4f} | "
             f"CV mean={result['cv_mean']:.4f} | "
-            f"Production train acc={result['train_accuracy']:.4f}"
+            f"Production train acc={result['train_accuracy']:.4f} | "
+            f"Features: {result.get('n_pruned_features', '?')}/{result.get('n_original_features', '?')} | "
+            f"Calibrated: {'yes' if result.get('calibrator') is not None else 'no'}"
         )
         logger.info("=" * 60)
 
@@ -706,6 +824,11 @@ class PredictionModel:
             "n_oos": result["n_oos"],
             "purge_gap": PURGE_GAP,
             "optuna_tuned": result["optuna_tuned"],
+            # v7: feature pruning and calibration info
+            "feature_pruned": result.get("feature_pruned", False),
+            "n_pruned_features": result.get("n_pruned_features"),
+            "n_original_features": result.get("n_original_features"),
+            "calibrated": result.get("calibrator") is not None,
         }
 
     # ------------------------------------------------------------------
@@ -743,6 +866,9 @@ class PredictionModel:
         self._pending_oos_metrics = result["oos_metrics"]
         self._pending_xgb_params = result["xgb_params"]
         self._pending_train_end_ts = result["train_end_ts"]
+        # v7: Store pending calibrator and pruned feature names
+        self._pending_calibrator = result.get("calibrator")
+        self._pending_pruned_feature_names = result.get("pruned_feature_names")
 
         # Compute current model's OOS metrics for comparison
         old_val_accuracy = self.val_accuracy if self.model else 0.0
@@ -762,6 +888,10 @@ class PredictionModel:
             "optuna_tuned": result["optuna_tuned"],
             "old_recent_accuracy": old_recent_accuracy,
             "new_recent_accuracy": result["recent_288_acc"],
+            # v7: pruning and calibration info
+            "feature_pruned": result.get("feature_pruned", False),
+            "n_pruned_features": result.get("n_pruned_features"),
+            "calibrated": result.get("calibrator") is not None,
         }
 
         logger.info(
@@ -789,9 +919,14 @@ class PredictionModel:
         self._n_train_samples = self._pending_n_samples
         self.train_end_ts = self._pending_train_end_ts
         self.last_train_time = datetime.now(timezone.utc)
+        # v7: Install pending calibrator and pruned feature names
+        self.calibrator = self._pending_calibrator
+        self.pruned_feature_names = self._pending_pruned_feature_names
 
         # Clear pending state
         self._pending_model = None
+        self._pending_calibrator = None
+        self._pending_pruned_feature_names = None
 
         logger.info(f"Pending model applied: val_accuracy={self.val_accuracy:.4f}")
 
@@ -811,6 +946,8 @@ class PredictionModel:
 
         # Clear pending state
         self._pending_model = None
+        self._pending_calibrator = None
+        self._pending_pruned_feature_names = None
 
         logger.info(
             f"Pending model rejected: keeping current val_accuracy={self.val_accuracy:.4f}"
@@ -823,7 +960,7 @@ class PredictionModel:
         }
 
     # ------------------------------------------------------------------
-    # Prediction / Inference (Fix C + D + feature safety net)
+    # Prediction / Inference (Fix C + D + feature safety net + v7 calibration)
     # ------------------------------------------------------------------
 
     def predict(
@@ -836,16 +973,17 @@ class PredictionModel:
         Fix D: The caller (bot.py) passes only COMPLETED candles.
         Fix C: NaN values are forward-filled consistently with training.
         Fix (v6): Feature safety net — gracefully handles column mismatches
-        between training feature_names and inference features (e.g. when
-        higher-TF data is unavailable and HTF feature columns are missing).
+        between training feature_names and inference features.
+        v7: Calibrated probabilities, EV-based filtering, pruned features.
 
         Args:
             df_5m: DataFrame of COMPLETED 5m candles (current candle excluded)
             higher_tf_data: Dict of higher-TF DataFrames (also completed only)
 
         Returns:
-            Dict with direction, confidence, strength, probabilities,
-            current_price, model_accuracy — or None if skipped.
+            Dict with direction, confidence (calibrated), raw_confidence,
+            ev, strength, probabilities, current_price, model_accuracy
+            — or None if skipped.
         """
         if self.model is None:
             logger.warning("No model available for prediction")
@@ -860,15 +998,17 @@ class PredictionModel:
                 logger.warning("Feature computation returned empty DataFrame")
                 return None
 
+            # Determine which feature set to use for prediction
+            # If we have pruned features, use those; otherwise fall back to
+            # full feature_names for backward compatibility with old models.
+            expected_cols = (
+                self.pruned_feature_names
+                if self.pruned_feature_names is not None
+                else self.feature_names
+            )
+
             # --- Feature safety net (v6 fix) ---
-            # The model was trained on self.feature_names, but inference may
-            # produce a different set of columns (e.g. HTF features missing
-            # when higher_tf_data is unavailable, or new features added).
-            # We align to the training feature set:
-            #   - Missing features -> filled with 0.0
-            #   - Extra features   -> dropped
             available_cols = set(features_df.columns)
-            expected_cols = self.feature_names
             missing_cols = [c for c in expected_cols if c not in available_cols]
             if missing_cols:
                 logger.warning(
@@ -889,20 +1029,64 @@ class PredictionModel:
                 )
                 latest = latest.fillna(0)
 
-            proba = self.model.predict_proba(latest)[0]
-            pred_class = int(np.argmax(proba))
-            confidence = float(proba[pred_class])
+            # --- Raw prediction ---
+            raw_proba = self.model.predict_proba(latest)
+            raw_prob_up = float(raw_proba[0][1])  # P(UP)
+            raw_prob_down = float(raw_proba[0][0])  # P(DOWN)
 
-            direction = "UP" if pred_class == 1 else "DOWN"
+            # --- Calibration (v7) ---
+            if self.calibrator is not None:
+                calibrated_prob_up = float(
+                    self.calibrator.predict(np.array([raw_prob_up]))[0]
+                )
+                # Safety bounds to avoid extreme probabilities
+                calibrated_prob_up = float(np.clip(calibrated_prob_up, 0.01, 0.99))
+            else:
+                calibrated_prob_up = raw_prob_up  # Fallback: no calibration
 
-            # Confidence filtering (Improvement 2)
-            if confidence < self.config.confidence_min:
+            # --- Direction from calibrated probability ---
+            direction = "UP" if calibrated_prob_up > 0.5 else "DOWN"
+
+            # Calibrated confidence for the predicted direction
+            calibrated_prob = (
+                calibrated_prob_up if direction == "UP"
+                else (1.0 - calibrated_prob_up)
+            )
+
+            # Raw confidence for the predicted direction (uncalibrated)
+            raw_confidence = (
+                raw_prob_up if direction == "UP"
+                else raw_prob_down
+            )
+
+            # --- EV calculation (v7) ---
+            ev = (
+                (calibrated_prob * self.config.win_payout)
+                - ((1.0 - calibrated_prob) * self.config.loss_amount)
+            )
+
+            # --- Filtering ---
+            # 1) Raw confidence floor (skip clearly garbage predictions)
+            if raw_confidence < self.config.confidence_min:
                 logger.info(
-                    f"Low confidence {confidence:.4f} < {self.config.confidence_min} — skipping"
+                    f"Low raw confidence {raw_confidence:.4f} < "
+                    f"{self.config.confidence_min} — skipping"
                 )
                 return None
 
-            strength = "STRONG" if confidence >= self.config.confidence_strong else "NORMAL"
+            # 2) EV filter (only trade positive or above-threshold EV)
+            if ev < self.config.ev_threshold:
+                logger.info(
+                    f"Negative EV ${ev:.4f} < threshold ${self.config.ev_threshold} — skipping "
+                    f"(dir={direction}, cal_prob={calibrated_prob:.4f}, raw_conf={raw_confidence:.4f})"
+                )
+                return None
+
+            # --- Signal strength from EV ---
+            strength = (
+                "STRONG" if ev >= self.config.ev_strong_threshold
+                else "NORMAL"
+            )
 
             # Get current price from last completed candle
             current_price = float(df_5m["close"].iloc[-1]) if not df_5m.empty else 0.0
@@ -910,16 +1094,22 @@ class PredictionModel:
             result = {
                 "signal": direction,
                 "direction": direction,
-                "confidence": confidence,
-                "strength": strength,
+                "confidence": calibrated_prob,           # NOW CALIBRATED
+                "raw_confidence": raw_confidence,         # Old uncalibrated value
+                "ev": ev,                                 # Expected value per trade
+                "strength": strength,                     # STRONG/NORMAL from EV
+                "calibrated_prob_up": calibrated_prob_up,
+                "calibrated_prob_down": 1.0 - calibrated_prob_up,
                 "current_price": current_price,
                 "model_accuracy": self.val_accuracy,
-                "probabilities": {"DOWN": float(proba[0]), "UP": float(proba[1])},
+                "probabilities": {"DOWN": raw_prob_down, "UP": raw_prob_up},
             }
 
             logger.info(
-                f"Prediction: {direction} ({confidence:.1%}) [{strength}] | "
-                f"P(UP)={proba[1]:.4f}, P(DOWN)={proba[0]:.4f}"
+                f"Prediction: {direction} [{strength}] | "
+                f"Cal={calibrated_prob:.1%}, Raw={raw_confidence:.1%} | "
+                f"EV=${ev:+.4f} | "
+                f"P(UP): raw={raw_prob_up:.4f}, cal={calibrated_prob_up:.4f}"
             )
             return result
 
@@ -936,6 +1126,11 @@ class PredictionModel:
         return {
             "has_model": self.model is not None,
             "feature_count": len(self.feature_names),
+            "pruned_feature_count": (
+                len(self.pruned_feature_names)
+                if self.pruned_feature_names is not None
+                else len(self.feature_names)
+            ),
             "train_accuracy": self.train_accuracy,
             "val_accuracy": self.val_accuracy,
             "train_samples": self._n_train_samples,
@@ -946,4 +1141,6 @@ class PredictionModel:
                 self.last_tune_time.isoformat() if self.last_tune_time else None
             ),
             "has_tuned_params": self.best_params is not None,
+            "has_calibrator": self.calibrator is not None,
+            "has_pruned_features": self.pruned_feature_names is not None,
         }

@@ -187,6 +187,8 @@ class AutoTrader:
         """
         direction = signal.get("signal", "NEUTRAL")
         confidence = signal.get("confidence", 0)
+        ev = signal.get("ev", 0.0)
+        strength = signal.get("strength", "NORMAL")
         strength = signal.get("strength", "SKIP")
         target_slot_ts = signal.get("target_slot_ts")
 
@@ -265,7 +267,7 @@ class AutoTrader:
         # --- Execute Trade ---
         slot_dt = PolymarketClient.slot_to_datetime(target_slot_ts)
         logger.info(
-            f"Executing trade: {direction} | conf={confidence:.4f} | "
+            f"Executing trade: {direction} [{strength}] | conf={confidence:.4f} | ev={ev:+.4f} | "
             f"strength={strength} | amount={self.trade_amount} USDC | "
             f"target_slot={slot_dt.strftime('%H:%M:%S')} UTC"
         )
@@ -283,6 +285,8 @@ class AutoTrader:
             # Enrich trade data with signal info
             trade_data = trade_result["data"]
             trade_data["confidence"] = confidence
+            trade_data["ev"] = ev
+            trade_data["strength"] = strength
             trade_data["strength"] = strength
             trade_data["balance_before"] = balance
             trade_data["balance_after"] = balance - self.trade_amount

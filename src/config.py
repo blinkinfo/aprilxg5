@@ -50,9 +50,30 @@ class ModelConfig:
     adx_period: int = 14
     ema_fast: int = 9
     ema_slow: int = 21
-    # Confidence filtering (Improvement 2)
-    confidence_min: float = 0.55  # Skip trades below this confidence
-    confidence_strong: float = 0.60  # Label as "strong" signal above this
+    # ---------------------------------------------------------------
+    # Confidence & EV filtering (Improvement: Calibration + EV-based)
+    # ---------------------------------------------------------------
+    # Raw confidence floor — predictions below this are always skipped
+    # even before calibration (saves compute on clearly garbage predictions).
+    confidence_min: float = 0.52
+    # EV-based filtering (replaces old confidence_strong threshold).
+    # Expected Value = (calibrated_prob * win_payout) - ((1 - calibrated_prob) * loss_amount)
+    # Default 0.0 means: only trade when EV >= 0 (i.e. positive expected value).
+    ev_threshold: float = 0.0
+    # EV above this marks the signal as "STRONG" (higher edge).
+    ev_strong_threshold: float = 0.05
+    # Binary market payout structure
+    win_payout: float = 0.96   # Profit on a win ($)
+    loss_amount: float = 1.00  # Loss on a loss ($)
+    # ---------------------------------------------------------------
+    # Probability calibration (Improvement 1)
+    # ---------------------------------------------------------------
+    enable_calibration: bool = True  # Fit isotonic regression on OOS split
+    # ---------------------------------------------------------------
+    # Feature pruning (Improvement 3)
+    # ---------------------------------------------------------------
+    enable_feature_pruning: bool = True  # Prune low-importance features
+    feature_prune_top_n: int = 20        # Keep top N features by importance
     # Regime detection (Improvement 6)
     atr_regime_lookback: int = 100  # Lookback period for ATR percentile
     # Optuna tuning (Improvement 5)
@@ -144,6 +165,24 @@ class BotConfig:
             config.model.optuna_timeout_seconds = int(os.environ["OPTUNA_TIMEOUT"])
         if os.environ.get("TRAIN_CANDLES"):
             config.model.train_candles = int(os.environ["TRAIN_CANDLES"])
+        # EV-based filtering
+        if os.environ.get("EV_THRESHOLD"):
+            config.model.ev_threshold = float(os.environ["EV_THRESHOLD"])
+        if os.environ.get("EV_STRONG_THRESHOLD"):
+            config.model.ev_strong_threshold = float(os.environ["EV_STRONG_THRESHOLD"])
+        # Calibration
+        if os.environ.get("ENABLE_CALIBRATION"):
+            config.model.enable_calibration = os.environ["ENABLE_CALIBRATION"].lower() in ("1", "true", "yes")
+        # Feature pruning
+        if os.environ.get("ENABLE_FEATURE_PRUNING"):
+            config.model.enable_feature_pruning = os.environ["ENABLE_FEATURE_PRUNING"].lower() in ("1", "true", "yes")
+        if os.environ.get("FEATURE_PRUNE_TOP_N"):
+            config.model.feature_prune_top_n = int(os.environ["FEATURE_PRUNE_TOP_N"])
+        # Payout structure
+        if os.environ.get("WIN_PAYOUT"):
+            config.model.win_payout = float(os.environ["WIN_PAYOUT"])
+        if os.environ.get("LOSS_AMOUNT"):
+            config.model.loss_amount = float(os.environ["LOSS_AMOUNT"])
 
         # Enforce minimum training candles to prevent under-training
         if config.model.train_candles < MIN_TRAIN_CANDLES:
@@ -174,6 +213,10 @@ class BotConfig:
             f"(~{config.model.train_candles * 5 // 1440} days of 5m data), "
             f"retrain_interval={config.model.retrain_interval_hours}h, "
             f"confidence_min={config.model.confidence_min}, "
+            f"ev_threshold={config.model.ev_threshold}, "
+            f"calibration={'ON' if config.model.enable_calibration else 'OFF'}, "
+            f"feature_pruning={'ON' if config.model.enable_feature_pruning else 'OFF'} "
+            f"(top {config.model.feature_prune_top_n}), "
             f"optuna={'ON' if config.model.enable_optuna_tuning else 'OFF'} "
             f"({config.model.optuna_n_trials} trials, {config.model.optuna_timeout_seconds}s timeout), "
             f"polymarket={pm_status}, "

@@ -181,6 +181,9 @@ class SignalBot:
             symbol=self.config.mexc.symbol,
             polymarket_enabled=self.config.polymarket.enabled,
             autotrade_on=self.auto_trader.enabled if self.auto_trader else False,
+            calibration_on=self.model.calibrator is not None,
+            pruning_on=self.model.pruned_feature_names is not None,
+            n_features=len(self.model.pruned_feature_names) if self.model.pruned_feature_names else len(self.model.feature_names),
         )
         await self.telegram.send_message(msg)
 
@@ -376,8 +379,9 @@ class SignalBot:
             else:
                 if prediction is not None:
                     logger.info(
-                        f"No signal: confidence below {self.config.model.confidence_min} "
-                        f"({prediction['confidence']:.4f})"
+                        f"No signal: filtered out "
+                        f"(conf={prediction.get('confidence', 0):.4f}, "
+                        f"ev={prediction.get('ev', 0):.4f})"
                     )
                 else:
                     logger.info("No signal: prediction returned None (insufficient data or low confidence)")
@@ -651,6 +655,10 @@ class SignalBot:
             optuna_tuned=self.model.best_xgb_params is not None,
             total_signals=stats.total_signals,
             pending=stats.pending,
+            calibration_on=self.model.calibrator is not None,
+            pruning_on=self.model.pruned_feature_names is not None,
+            n_features=len(self.model.pruned_feature_names) if self.model.pruned_feature_names else len(self.model.feature_names),
+            n_total_features=len(self.model.feature_names),
         )
 
     async def _retrain_model(self) -> str:

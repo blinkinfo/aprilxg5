@@ -230,8 +230,9 @@ def test_model(results: TestResults, df_hist, df_15m, df_1h):
         elif prediction["signal"] in ("UP", "DOWN"):
             assert prediction["confidence"] >= config.confidence_min, \
                 f"Active signal should have confidence >= {config.confidence_min}, got {prediction['confidence']}"
-            if prediction["confidence"] >= config.confidence_strong:
-                assert prediction["strength"] == "STRONG", "High confidence should be STRONG"
+            # v7: Strength is now based on EV, not raw confidence threshold
+            if prediction.get("ev", 0) >= config.model.ev_strong_threshold:
+                assert prediction["strength"] == "STRONG", "High EV should be STRONG"
 
         results.ok(
             f"Prediction: {prediction['signal']} [{prediction['strength']}] "
@@ -385,8 +386,15 @@ def test_config(results: TestResults):
         config = BotConfig()
         assert config.mexc.symbol == "BTCUSDT"
         assert config.model.train_candles == 43200, f"train_candles should be 43200, got {config.model.train_candles}"
-        assert config.model.confidence_min == 0.55, f"confidence_min should be 0.55, got {config.model.confidence_min}"
-        assert config.model.confidence_strong == 0.60, f"confidence_strong should be 0.60"
+        assert config.model.confidence_min == 0.52, f"confidence_min should be 0.52, got {config.model.confidence_min}"
+        # v7: confidence_strong removed, replaced by EV-based thresholds
+        assert config.model.ev_threshold == 0.0, f"ev_threshold should be 0.0, got {config.model.ev_threshold}"
+        assert config.model.ev_strong_threshold == 0.05, f"ev_strong_threshold should be 0.05"
+        assert config.model.win_payout == 0.96, f"win_payout should be 0.96"
+        assert config.model.loss_amount == 1.00, f"loss_amount should be 1.00"
+        assert config.model.enable_calibration is True, "enable_calibration should default to True"
+        assert config.model.enable_feature_pruning is True, "enable_feature_pruning should default to True"
+        assert config.model.feature_prune_top_n == 20, f"feature_prune_top_n should be 20"
         assert config.model.enable_optuna_tuning is True, "Optuna should be enabled by default"
         assert config.model.retrain_min_improvement == 0.002, f"retrain_min_improvement should be 0.002"
         assert config.model.atr_regime_lookback == 100, f"atr_regime_lookback should be 100"

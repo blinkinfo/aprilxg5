@@ -103,7 +103,9 @@ def format_signal(signal, prediction: dict) -> str:
         HTML-formatted message string
     """
     direction = signal.direction
-    confidence = signal.confidence
+    confidence = signal.confidence  # Now calibrated probability
+    raw_confidence = prediction.get("raw_confidence", confidence)
+    ev = prediction.get("ev", 0.0)
     slot_str = _format_slot(signal.candle_slot_ts) if signal.candle_slot_ts else "N/A"
     price = f"${signal.entry_price:,.2f}"
 
@@ -125,7 +127,9 @@ def format_signal(signal, prediction: dict) -> str:
         f"{dir_emoji} <b>{direction}</b>     {slot_str}",
         "",
         "<code>"
-        f"Confidence       {confidence:.1%}\n"
+        f"Confidence (cal)  {confidence:.1%}\n"
+        f"Confidence (raw)  {raw_confidence:.1%}\n"
+        f"Expected Value    {'+' if ev >= 0 else ''}{ev:.4f}\n"
         f"Price            {price}\n"
         f"Model            {model_acc:.1%}"
         "</code>",
@@ -354,6 +358,10 @@ def format_status(
     optuna_tuned: bool,
     total_signals: int,
     pending: int,
+    calibration_on: bool = False,
+    pruning_on: bool = False,
+    n_features: int = 0,
+    n_total_features: int = 0,
 ) -> str:
     """Format bot status as an HTML Telegram message."""
     status_emoji = "\U0001f7e2" if running else "\U0001f534"  # green/red circle
@@ -389,7 +397,9 @@ def format_status(
         f"Samples          {train_samples:,}\n"
         f"Last Trained     {trained_str}\n"
         f"Next Retrain     {retrain_remaining}\n"
-        f"Optuna           {optuna_str} {tuned_str}"
+        f"Optuna           {optuna_str} {tuned_str}\n"
+        f"Calibration      {'ON' if calibration_on else 'OFF'}\n"
+        f"Features         {n_features}/{n_total_features} {'(pruned)' if pruning_on else ''}"
         "</code>",
         "",
         "\U0001f4d0 <b>Config</b>",
@@ -461,9 +471,9 @@ def format_help() -> str:
         "/redeem          Redeem resolved positions</code>",
         "",
         "\u26a1 <b>Signal Strength</b>",
-        "<code>  STRONG         Confidence &gt;= 60%\n"
-        "  NORMAL         Confidence 55-60%\n"
-        "  Below 55% signals are skipped.</code>",
+        "<code>  STRONG         EV &gt;= $0.05 per trade\n"
+        "  NORMAL         EV &gt;= $0.00 (positive EV)\n"
+        "  Negative EV signals are skipped.</code>",
         "",
         "\U0001f4b5 <b>Payouts</b>",
         "<code>  Win  +$0.96    Loss  -$1.00\n"
@@ -543,6 +553,9 @@ def format_startup(
     symbol: str,
     polymarket_enabled: bool = False,
     autotrade_on: bool = False,
+    calibration_on: bool = False,
+    pruning_on: bool = False,
+    n_features: int = 0,
 ) -> str:
     """Format bot startup/online message."""
     days = train_candles * 5 // 1440
@@ -559,7 +572,9 @@ def format_startup(
         "",
         "<code>"
         f"Model            {model_accuracy:.1%} accuracy\n"
-        f"Threshold        &gt;= {confidence_min:.0%} confidence\n"
+        f"Threshold        &gt;= {confidence_min:.0%} raw confidence\n"
+        f"Calibration      {'ON' if calibration_on else 'OFF'}\n"
+        f"Feature Pruning  {'ON (' + str(n_features) + ' features)' if pruning_on else 'OFF'}\n"
         f"Data             {train_candles:,} candles (~{days}d)\n"
         f"Signals          {tracked_signals} tracked"
         f"{pm_str}"
