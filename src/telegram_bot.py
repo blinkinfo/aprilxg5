@@ -59,6 +59,7 @@ _BOT_COMMANDS = [
     BotCommand("positions", "View open Polymarket positions"),
     BotCommand("pmstatus", "Full Polymarket connection status"),
     BotCommand("redeem", "Redeem resolved Polymarket positions"),
+    BotCommand("backtest", "Backtest model on historical data"),
 ]
 
 
@@ -81,6 +82,7 @@ class TelegramBot:
         self._balance_callback: Optional[Callable[[], Awaitable[str]]] = None
         self._positions_callback: Optional[Callable[[], Awaitable[str]]] = None
         self._pmstatus_callback: Optional[Callable[[], Awaitable[str]]] = None
+        self._backtest_callback: Optional[Callable] = None
 
     def set_callbacks(
         self,
@@ -96,6 +98,7 @@ class TelegramBot:
         positions_cb: Optional[Callable[[], Awaitable[str]]] = None,
         pmstatus_cb: Optional[Callable[[], Awaitable[str]]] = None,
         redeem_cb: Optional[Callable[[], Awaitable[str]]] = None,
+        backtest_cb: Optional[Callable] = None,
     ):
         """Set callback functions for bot commands."""
         self._stats_callback = stats_cb
@@ -110,6 +113,7 @@ class TelegramBot:
         self._positions_callback = positions_cb
         self._pmstatus_callback = pmstatus_cb
         self._redeem_cb = redeem_cb
+        self._backtest_callback = backtest_cb
 
     async def initialize(self):
         """Initialize the bot, register handlers, and set menu commands."""
@@ -140,6 +144,8 @@ class TelegramBot:
         self.application.add_handler(CommandHandler("pmstatus", self._cmd_pmstatus))
         # Redemption command
         self.application.add_handler(CommandHandler("redeem", self._handle_redeem))
+        # Backtest command
+        self.application.add_handler(CommandHandler("backtest", self._cmd_backtest))
         # Inline button callback handler (for retrain swap/keep decisions)
         self.application.add_handler(CallbackQueryHandler(self._handle_callback_query))
 
